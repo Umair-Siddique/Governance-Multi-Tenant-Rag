@@ -8,3 +8,4 @@ cryptography
 anthropic
 mistralai
 pinecone
+gunicorn
