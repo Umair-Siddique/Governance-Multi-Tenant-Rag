@@ -17,7 +17,7 @@ class Config:
     ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", os.getenv("SECRET_KEY", "default-encryption-key-change-in-production"))
     
     # Backend URL for verification links
-    BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:5001")
+    BACKEND_URL = os.getenv("BACKEND_URL")
     
     # Frontend URL (update based on your deployment)
     FRONTEND_URL = os.getenv("FRONTEND_URL")
