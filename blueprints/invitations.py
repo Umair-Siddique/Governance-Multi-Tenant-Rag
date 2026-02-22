@@ -1,22 +1,8 @@
-"""
-Tenant Invitation API
-Admins can invite editors, reviewers, and end-users to their tenant.
-
-Flow:
-  1.  POST  /api/invitations          → admin sends invite  → email with signed token link
-  2.  GET   /api/invitations          → admin lists all invitations for their tenant
-  3.  DELETE /api/invitations/<id>    → admin revokes a pending invite
-  4.  GET   /auth/accept-invite/<tok> → invitee validates token → receives invite details
-  5.  POST  /auth/accept-invite/<tok> → invitee sets password  → account created
-
-Roles that can be invited: 'editor', 'reviewer', 'user'
-Only users with role='admin' may send/list/revoke invitations.
-"""
-
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import requests as http_requests
 from flask import Blueprint, request, jsonify, current_app
 
 from utils.auth_helpers import require_role
@@ -173,7 +159,7 @@ def send_invitation(**kwargs):
         invite_token = token_service.generate_invite_token(token_payload)
 
         # ── Build invite URL (frontend handles the accept UI) ─────────────────
-        frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = current_app.config.get('FRONTEND_URL')
         invite_url = f"{frontend_url}/accept-invite/{invite_token}"
 
         # ── Send invitation email ─────────────────────────────────────────────
@@ -447,12 +433,18 @@ def accept_invite(token):
         if full_name:
             user_metadata['full_name'] = full_name
 
-        # ── Create Supabase user (email already verified via invite link) ─────
-        try:
-            create_response = supabase.auth.admin.create_user({
+        # ── Create Supabase user via direct GoTrue admin REST call ──────────
+        # Using http_requests directly avoids the Python client's "user not
+        # allowed" restriction that can occur even when email signup is enabled.
+        supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+        service_key  = current_app.config.get('SUPABASE_SECRET_KEY', '')
+
+        create_resp = http_requests.post(
+            f"{supabase_url}/auth/v1/admin/users",
+            json={
                 'email': invited_email,
                 'password': password,
-                'email_confirm': True,          # Invite link = email proof
+                'email_confirm': True,
                 'user_metadata': user_metadata,
                 'app_metadata': {
                     'provider': 'email',
@@ -460,21 +452,37 @@ def accept_invite(token):
                     'tenant_id': tenant_id,
                     'role': role,
                 },
-            })
-            new_user = create_response.user if hasattr(create_response, 'user') else create_response
-            if not new_user:
-                return jsonify({'error': 'Failed to create user account'}), 500
-        except Exception as e:
-            err = str(e)
-            err_lower = err.lower()
-            if 'already registered' in err_lower or 'already exists' in err_lower:
+            },
+            headers={
+                'Authorization': f'Bearer {service_key}',
+                'apikey': service_key,
+                'Content-Type': 'application/json',
+            },
+            timeout=10,
+        )
+
+        if create_resp.status_code in (200, 201):
+            new_user_data = create_resp.json()
+        elif create_resp.status_code == 422:
+            try:
+                err_msg = create_resp.json().get('message') or create_resp.text
+            except Exception:
+                err_msg = create_resp.text
+            err_lower = err_msg.lower()
+            if 'already registered' in err_lower or 'already exists' in err_lower or 'email address already registered' in err_lower:
                 return jsonify({'error': 'An account with this email already exists. Please sign in.'}), 409
-            if 'user not allowed' in err_lower or 'not allowed' in err_lower:
-                return jsonify({
-                    'error': 'Account creation is restricted by Supabase settings.',
-                    'details': 'Please ensure "Enable email signup" is ON in your Supabase Dashboard → Authentication → Settings.'
-                }), 403
-            return jsonify({'error': f'Failed to create account: {err}'}), 400
+            return jsonify({'error': f'Failed to create account: {err_msg}'}), 400
+        else:
+            try:
+                err_msg = create_resp.json().get('message') or create_resp.text
+            except Exception:
+                err_msg = create_resp.text or f'HTTP {create_resp.status_code}'
+            return jsonify({'error': f'Failed to create account: {err_msg}'}), 400
+
+        new_user_id    = new_user_data.get('id')
+        new_user_email = new_user_data.get('email', invited_email)
+        if not new_user_id:
+            return jsonify({'error': 'Failed to create user account'}), 500
 
         # ── Mark invitation as accepted ───────────────────────────────────────
         supabase.table('tenant_invitations').update({
@@ -505,8 +513,8 @@ def accept_invite(token):
         return jsonify({
             'message': 'Account created successfully. You can now sign in.',
             'user': {
-                'id': new_user.id,
-                'email': new_user.email,
+                'id': new_user_id,
+                'email': new_user_email,
                 'tenant_id': tenant_id,
                 'role': role,
             }

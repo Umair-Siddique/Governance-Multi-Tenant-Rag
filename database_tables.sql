@@ -15,27 +15,25 @@ ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tenant_details JSONB DEFAULT '{}'::
 ALTER TABLE tenants DROP CONSTRAINT IF EXISTS tenants_tenant_type_check;
 ALTER TABLE tenants ADD CONSTRAINT tenants_tenant_type_check CHECK (tenant_type IN ('self_managed', 'white_label'));
 
--- Add Row Level Security (RLS) policies for tenant isolation
+-- Enable RLS
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 
--- Service role can manage all tenants
-CREATE POLICY "Service role can manage all tenants"
-    ON tenants
-    FOR ALL
-    USING (auth.role() = 'service_role')
-    WITH CHECK (auth.role() = 'service_role');
+-- Drop old policies before recreating
+DROP POLICY IF EXISTS "Service role can manage all tenants" ON tenants;
+DROP POLICY IF EXISTS "Users can access their tenant" ON tenants;
 
--- Authenticated users can only access their own tenant
-CREATE POLICY "Users can access their tenant"
+-- Any authenticated user can only read/write their own tenant row.
+-- tenant_id is stored under user_metadata.tenant_id in the JWT.
+-- auth.jwt()->'user_metadata'->>'tenant_id' correctly parses the nested JSON.
+CREATE POLICY "Tenant isolation for authenticated users"
     ON tenants
     FOR ALL
+    TO authenticated
     USING (
-        auth.role() = 'authenticated' AND
-        id::text = (auth.jwt() ->> 'user_metadata')::jsonb->>'tenant_id'
+        id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
     )
     WITH CHECK (
-        auth.role() = 'authenticated' AND
-        id::text = (auth.jwt() ->> 'user_metadata')::jsonb->>'tenant_id'
+        id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
     );
 
 CREATE TABLE llm_providers (
@@ -52,47 +50,24 @@ CREATE TABLE llm_providers (
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );
 
--- Add Row Level Security (RLS) policies for tenant isolation
+-- Enable RLS
 ALTER TABLE llm_providers ENABLE ROW LEVEL SECURITY;
 
--- Create a policy that allows service_role to bypass RLS
--- Service role (used by backend) can do everything
-CREATE POLICY "Service role can manage all LLM providers"
+-- Drop old policies before recreating
+DROP POLICY IF EXISTS "Service role can manage all LLM providers" ON llm_providers;
+DROP POLICY IF EXISTS "Service role full access" ON llm_providers;
+DROP POLICY IF EXISTS "Users can access their tenant's providers" ON llm_providers;
+
+-- Any authenticated user can only read/write rows belonging to their own tenant.
+CREATE POLICY "Tenant isolation for authenticated users"
     ON llm_providers
     FOR ALL
+    TO authenticated
     USING (
-        auth.role() = 'service_role'
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
     )
     WITH CHECK (
-        auth.role() = 'service_role'
-    );
-
--- Alternative: If you want to keep tenant isolation for regular users
--- but allow service role to bypass, you can use this instead:
-
--- First, drop the service role policy above if you created it
--- DROP POLICY IF EXISTS "Service role can manage all LLM providers" ON llm_providers;
-
--- Then create separate policies:
--- 1. Allow service_role full access
-CREATE POLICY "Service role full access"
-    ON llm_providers
-    FOR ALL
-    USING (auth.role() = 'service_role')
-    WITH CHECK (auth.role() = 'service_role');
-
--- 2. For authenticated users (if you want to support direct DB access later)
--- This is optional and can be removed if you only use service role
-CREATE POLICY "Users can access their tenant's providers"
-    ON llm_providers
-    FOR ALL
-    USING (
-        auth.role() = 'authenticated' AND
-        tenant_id::text = (auth.jwt() ->> 'user_metadata')::jsonb->>'tenant_id'
-    )
-    WITH CHECK (
-        auth.role() = 'authenticated' AND
-        tenant_id::text = (auth.jwt() ->> 'user_metadata')::jsonb->>'tenant_id'
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
     );
 
 -- ============================================================
@@ -118,12 +93,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS tenant_invitations_pending_unique
     ON tenant_invitations (tenant_id, invited_email)
     WHERE status = 'pending';
 
--- Row Level Security
+-- Enable RLS
 ALTER TABLE tenant_invitations ENABLE ROW LEVEL SECURITY;
 
--- Service role (backend) has full access
-CREATE POLICY "Service role can manage all invitations"
+-- Drop old policies before recreating
+DROP POLICY IF EXISTS "Service role can manage all invitations" ON tenant_invitations;
+
+-- Any authenticated user can only read/write invitations belonging to their own tenant.
+CREATE POLICY "Tenant isolation for authenticated users"
     ON tenant_invitations
     FOR ALL
-    USING (auth.role() = 'service_role')
-    WITH CHECK (auth.role() = 'service_role');
+    TO authenticated
+    USING (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    )
+    WITH CHECK (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    );

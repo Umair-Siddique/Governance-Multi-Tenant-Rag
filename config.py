@@ -10,11 +10,11 @@ class Config:
     ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
     
     # Secret key for token signing (can use same as Supabase or generate a new one)
-    SECRET_KEY = os.getenv("SECRET_KEY", os.getenv("SUPABASE_SECRET_KEY", "default-secret-key-change-in-production"))
+    SECRET_KEY = os.getenv("SECRET_KEY", os.getenv("SUPABASE_SECRET_KEY"))
     
     # Encryption key for API keys (must be 32 bytes for Fernet)
     # Generate with: from cryptography.fernet import Fernet; Fernet.generate_key()
-    ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", os.getenv("SECRET_KEY", "default-encryption-key-change-in-production"))
+    ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", os.getenv("SECRET_KEY"))
     
     # Backend URL for verification links
     BACKEND_URL = os.getenv("BACKEND_URL")

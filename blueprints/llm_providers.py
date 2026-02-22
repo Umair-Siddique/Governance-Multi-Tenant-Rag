@@ -31,7 +31,6 @@ def validate_provider_data(data: dict):
     """
     provider_type = data.get('provider_type', '').lower()
     api_key = data.get('api_key', '')
-    default_model = data.get('default_model', '')
     
     if not provider_type:
         return False, "provider_type is required"
@@ -348,6 +347,82 @@ def delete_llm_provider(provider_id, **kwargs):
             'message': 'LLM provider deleted successfully'
         }), 200
     
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+
+@llm_providers_bp.route('/llm-providers/supported', methods=['GET'])
+@require_auth
+def get_supported_providers(**kwargs):
+    """Get list of all supported LLM provider types"""
+    try:
+        providers = LLMProviderFactory.get_supported_providers()
+        
+        # Add provider metadata
+        provider_info = []
+        for provider_type in providers:
+            provider_info.append({
+                'type': provider_type,
+                'name': provider_type.title(),
+                'default_models': LLMProviderFactory.get_provider_models(provider_type)
+            })
+        
+        return jsonify({
+            'providers': provider_info,
+            'count': len(providers)
+        }), 200
+    
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+
+@llm_providers_bp.route('/llm-providers/<provider_type>/models', methods=['GET'])
+@require_auth
+def get_provider_models(provider_type, **kwargs):
+    """Get list of available models for a specific LLM provider type"""
+    try:
+        # tenant_id is already extracted by @require_auth decorator
+        tenant_id = kwargs.get('tenant_id')
+        
+        provider_type_lower = provider_type.lower()
+        
+        # Validate provider type
+        if provider_type_lower not in LLMProviderFactory.get_supported_providers():
+            return jsonify({
+                'error': f'Unsupported provider type: {provider_type}. Supported: {LLMProviderFactory.get_supported_providers()}'
+            }), 400
+        
+        # Try to get API key from tenant's configured provider (optional)
+        api_key = None
+        supabase = current_app.supabase_client
+        if supabase:
+            try:
+                # Check if tenant has a configured provider of this type
+                result = supabase.table('llm_providers').select('*').eq('tenant_id', tenant_id).eq('provider_type', provider_type_lower).eq('is_active', True).limit(1).execute()
+                
+                if result.data:
+                    # Decrypt API key to get real-time model list
+                    encryption_service = get_encryption_service()
+                    try:
+                        api_key = encryption_service.decrypt(result.data[0]['encrypted_api_key'])
+                    except Exception:
+                        # If decryption fails, continue without API key
+                        pass
+            except Exception:
+                # If database query fails, continue without API key
+                pass
+        
+        # Get models (with or without API key)
+        models = LLMProviderFactory.get_provider_models(provider_type_lower, api_key)
+        
+        return jsonify({
+            'provider_type': provider_type_lower,
+            'models': models,
+            'count': len(models)
+        }), 200
+    
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
