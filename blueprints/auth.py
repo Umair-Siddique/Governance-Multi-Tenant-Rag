@@ -357,10 +357,10 @@ def google_signin():
             return jsonify({'error': 'Authentication service not configured'}), 500
 
         try:
-            redirect_to = current_app.config.get('FRONTEND_URL') or current_app.config.get('BACKEND_URL')
+            frontend_url = (current_app.config.get('FRONTEND_URL') or current_app.config.get('BACKEND_URL', '')).rstrip('/')
             oauth_payload = {'provider': 'google'}
-            if redirect_to:
-                oauth_payload['options'] = {'redirect_to': redirect_to}
+            if frontend_url:
+                oauth_payload['options'] = {'redirect_to': f"{frontend_url}/auth/callback"}
 
             response = supabase.auth.sign_in_with_oauth(oauth_payload)
         except Exception as e:
@@ -620,11 +620,9 @@ def verify_email_token(token):
             email_service = current_app.email_service
             if email_service:
                 email_service.send_welcome_email(email)
-            
-            return jsonify({
-                'message': 'Email verified successfully! You can now sign in.',
-                'email': email
-            }), 200
+
+            frontend_url = current_app.config.get('FRONTEND_URL', '').rstrip('/')
+            return redirect(f"{frontend_url}/create-tenant", code=302)
             
         except Exception as e:
             error_msg = str(e)
@@ -737,8 +735,8 @@ def forgot_password():
                 reset_token = token_service.generate_password_reset_token(email)
                 # Send the token to the frontend; the frontend will include it
                 # in the Authorization header when calling POST /auth/reset-password
-                frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
-                reset_url = f"{frontend_url}/reset-password?token={reset_token}"
+                frontend_url = current_app.config.get('FRONTEND_URL')
+                reset_url = f"{frontend_url}/reset-password/{reset_token}"
                 email_service.send_password_reset_email(email, reset_url)
 
             return jsonify({
