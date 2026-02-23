@@ -14,10 +14,9 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
-    # Allow all origins with comprehensive settings
     CORS(app, 
          supports_credentials=True, 
-         origins="*",
+         origins=["https://governance-saas.vercel.app"],
          methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
          allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
          expose_headers=['Content-Type', 'Authorization']
