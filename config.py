@@ -23,3 +23,9 @@ class Config:
     FRONTEND_URL = os.getenv("FRONTEND_URL")
 
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+
+    # Microsoft Entra ID (Azure AD) – OIDC via Supabase OAuth provider
+    AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
+    AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
+    # e.g. https://login.microsoftonline.com/common/v2.0  (or a single-tenant URL)
+    AZURE_TENANT_URL = os.getenv("AZURE_TENANT_URL", "https://login.microsoftonline.com/common")

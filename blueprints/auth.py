@@ -1,12 +1,146 @@
 from flask import Blueprint, request, jsonify, current_app, redirect, make_response
 from utils.auth_helpers import require_auth
+from types import SimpleNamespace
+from datetime import datetime
+import base64
+import hashlib
+import secrets
 import re
 import uuid
 import time
+import urllib.parse
 import requests as http_requests
 
 
 auth_bp = Blueprint('auth', __name__)
+
+
+def _exchange_code_http(supabase_url, service_key, auth_code, code_verifier=None):
+    """
+    Exchange an OAuth authorization code for a Supabase session via direct
+    HTTP instead of supabase.auth.exchange_code_for_session().
+
+    WHY: The supabase-py SDK stores the returned session on the shared client
+    and fires an auth-state listener that replaces the PostgREST Authorization
+    header with the user's JWT.  Every table() call after that runs under RLS
+    (user context) instead of the service-role key, causing policy violations.
+    Using HTTP directly leaves the shared admin client completely untouched.
+
+    Returns a SimpleNamespace(user=..., session=...) that mirrors the SDK
+    response shape so existing code needs no changes.
+    """
+    body = {'auth_code': auth_code}
+    if code_verifier:
+        body['code_verifier'] = code_verifier
+
+    resp = http_requests.post(
+        f"{supabase_url}/auth/v1/token?grant_type=pkce",
+        json=body,
+        headers={
+            'apikey':        service_key,
+            'Content-Type':  'application/json',
+        },
+        timeout=15,
+    )
+
+    if resp.status_code != 200:
+        try:
+            msg = resp.json().get('error_description') or resp.json().get('msg') or resp.text
+        except Exception:
+            msg = resp.text or f'HTTP {resp.status_code}'
+        raise Exception(msg)
+
+    data = resp.json()
+    raw  = data.get('user') or {}
+
+    def _dt(val):
+        if not val:
+            return None
+        try:
+            return datetime.fromisoformat(val.replace('Z', '+00:00'))
+        except Exception:
+            return val
+
+    user = SimpleNamespace(
+        id                 = raw.get('id'),
+        email              = raw.get('email', ''),
+        user_metadata      = raw.get('user_metadata') or {},
+        app_metadata       = raw.get('app_metadata')  or {},
+        email_confirmed_at = _dt(raw.get('email_confirmed_at')),
+        created_at         = _dt(raw.get('created_at')),
+    )
+    session = SimpleNamespace(
+        access_token  = data.get('access_token'),
+        refresh_token = data.get('refresh_token'),
+        expires_in    = data.get('expires_in'),
+        expires_at    = data.get('expires_at'),
+        token_type    = data.get('token_type', 'bearer'),
+    )
+    return SimpleNamespace(user=user, session=session)
+
+
+def _create_user_admin_http(supabase_url, service_key, email, password, user_metadata, app_metadata):
+    """
+    Create an Auth user through GoTrue admin REST directly.
+
+    Using HTTP here avoids SDK auth-state side effects on the shared client.
+    """
+    resp = http_requests.post(
+        f"{supabase_url}/auth/v1/admin/users",
+        json={
+            'email': email,
+            'password': password,
+            'email_confirm': False,
+            'user_metadata': user_metadata,
+            'app_metadata': app_metadata,
+        },
+        headers={
+            'Authorization': f'Bearer {service_key}',
+            'apikey': service_key,
+            'Content-Type': 'application/json',
+        },
+        timeout=15,
+    )
+
+    if resp.status_code not in (200, 201):
+        try:
+            payload = resp.json()
+            msg = (
+                payload.get('msg')
+                or payload.get('message')
+                or payload.get('error_description')
+                or payload.get('error')
+                or str(payload)
+            )
+        except Exception:
+            msg = resp.text or f'HTTP {resp.status_code}'
+        raise Exception(msg)
+
+    raw = resp.json() or {}
+    created_at = raw.get('created_at')
+    try:
+        created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00')) if created_at else None
+    except Exception:
+        pass
+
+    return SimpleNamespace(
+        id=raw.get('id'),
+        email=raw.get('email', ''),
+        created_at=created_at,
+    )
+
+
+def _b64url_no_padding(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip('=')
+
+
+def _generate_pkce_pair():
+    # RFC 7636 code_verifier: 43-128 chars from unreserved URL charset.
+    code_verifier = secrets.token_urlsafe(64)[:96]
+    digest = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+    code_challenge = _b64url_no_padding(digest)
+    return code_verifier, code_challenge
+
 
 # Temporary server-side PKCE store: {state_id -> {code_verifier, expires_at}}
 # Entries expire after 10 minutes.
@@ -98,9 +232,11 @@ def register():
         if not is_valid:
             return jsonify({'error': error_msg}), 400
         
-        # Get Supabase client
-        supabase = current_app.supabase_client
-        if not supabase:
+        # Use direct GoTrue admin REST for registration to avoid SDK auth-state
+        # side effects when the shared Supabase client has user sessions.
+        supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+        service_key = current_app.config.get('SUPABASE_SECRET_KEY', '')
+        if not supabase_url or not service_key:
             return jsonify({'error': 'Authentication service not configured'}), 500
         
         # Register user with Supabase Auth using admin API to bypass email sending
@@ -122,35 +258,30 @@ def register():
                 'role': 'admin'  # Also set in app_metadata for JWT token
             }
             
-            # Use admin.create_user to bypass Supabase's email sending
-            # This prevents rate limit issues
-            # Note: Make sure email signups are enabled in Supabase Auth settings
             try:
-                response = supabase.auth.admin.create_user({
-                    'email': email,
-                    'password': password,
-                    'email_confirm': False,  # Don't auto-confirm - we'll verify via our own email
-                    'user_metadata': user_metadata,
-                    'app_metadata': app_metadata
-                })
+                user = _create_user_admin_http(
+                    supabase_url=supabase_url,
+                    service_key=service_key,
+                    email=email,
+                    password=password,
+                    user_metadata=user_metadata,
+                    app_metadata=app_metadata
+                )
             except Exception as create_error:
                 error_str = str(create_error)
                 # Provide more helpful error messages
                 if 'not allowed' in error_str.lower() or 'user not allowed' in error_str.lower():
                     return jsonify({
-                        'error': 'User registration is not allowed. Please check Supabase Auth settings:',
+                        'error': 'User registration request was rejected by Supabase.',
                         'details': [
-                            '1. Go to Supabase Dashboard > Authentication > Settings',
-                            '2. Ensure "Enable email signup" is enabled',
-                            '3. Check if there are any email domain restrictions',
-                            '4. Verify your SUPABASE_SECRET_KEY has admin permissions'
+                            '1. Verify SUPABASE_SECRET_KEY is the service_role key (not anon/public key)',
+                            '2. Confirm Auth settings do not block this email/domain',
+                            '3. Check if a custom Auth hook or external provider policy is rejecting signups',
+                            '4. Review original_error for the exact Supabase rejection reason'
                         ],
                         'original_error': error_str
                     }), 403
                 raise  # Re-raise if it's a different error
-            
-            # Handle different response types
-            user = response.user if hasattr(response, 'user') else response
             
             if not user:
                 return jsonify({'error': 'Failed to create user account'}), 500
@@ -352,70 +483,51 @@ def google_signin():
         for k in expired_keys:
             _pkce_store.pop(k, None)
 
-        supabase = current_app.supabase_client
-        if not supabase:
+        supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+        if not supabase_url:
             return jsonify({'error': 'Authentication service not configured'}), 500
 
-        try:
-            frontend_url = (current_app.config.get('FRONTEND_URL') or current_app.config.get('BACKEND_URL', '')).rstrip('/')
-            oauth_payload = {'provider': 'google'}
-            if frontend_url:
-                oauth_payload['options'] = {'redirect_to': f"{frontend_url}/auth/callback"}
+        frontend_url = (
+            current_app.config.get('FRONTEND_URL')
+            or current_app.config.get('BACKEND_URL', '')
+        ).rstrip('/')
+        redirect_to = f"{frontend_url}/auth/callback" if frontend_url else None
 
-            response = supabase.auth.sign_in_with_oauth(oauth_payload)
-        except Exception as e:
-            return jsonify({'error': f'Google OAuth start failed: {str(e)}'}), 400
-
-        # Extract auth URL
-        auth_url = None
-        if isinstance(response, dict):
-            auth_url = response.get('url') or ((response.get('data') or {}).get('url'))
-        else:
-            auth_url = getattr(response, 'url', None)
-            if not auth_url and hasattr(response, 'data'):
-                response_data = getattr(response, 'data', None) or {}
-                if isinstance(response_data, dict):
-                    auth_url = response_data.get('url')
-
-        if not auth_url:
-            return jsonify({
-                'error': 'Failed to generate Google OAuth URL',
-                'details': 'Supabase did not return an OAuth URL'
-            }), 500
-
-        # Extract PKCE code_verifier produced by the Supabase client
-        code_verifier = getattr(response, 'code_verifier', None)
-        if not code_verifier and isinstance(response, dict):
-            code_verifier = response.get('code_verifier')
-
-        # Store code_verifier server-side keyed by a state_id (10-min TTL)
+        # Build PKCE pair on the server so we always have a verifier to
+        # exchange with /auth/google-callback (works for curl and browser flows).
+        code_verifier, code_challenge = _generate_pkce_pair()
         state_id = str(uuid.uuid4())
-        if code_verifier:
-            _pkce_store[state_id] = {
-                'code_verifier': code_verifier,
-                'expires_at':    now + 600,
-            }
+        _pkce_store[state_id] = {
+            'code_verifier': code_verifier,
+            'expires_at':    now + 600,
+        }
 
-        # ── JSON mode (API / curl testing) ───────────────────────────────
+        params = {
+            'provider': 'google',
+            'code_challenge': code_challenge,
+            'code_challenge_method': 's256',
+        }
+        if redirect_to:
+            params['redirect_to'] = redirect_to
+        auth_url = f"{supabase_url}/auth/v1/authorize?{urllib.parse.urlencode(params)}"
+
+        # JSON mode for API/curl testing
         if request.args.get('format') == 'json':
             return jsonify({
                 'message': 'Open auth_url in a browser to continue Google sign in',
                 'auth_url': auth_url,
-                'state':    state_id if code_verifier else None,
+                'state': state_id,
             }), 200
 
-        # ── Browser redirect mode ─────────────────────────────────────────
-        # Set code_verifier in an HttpOnly cookie so the frontend can include
-        # it (or the state_id) when calling POST /auth/google-callback.
+        # Browser redirect mode
         resp = make_response(redirect(auth_url, code=302))
-        if code_verifier:
-            resp.set_cookie(
-                'pkce_code_verifier',
-                code_verifier,
-                max_age=600,
-                httponly=True,
-                samesite='Lax',
-            )
+        resp.set_cookie(
+            'pkce_code_verifier',
+            code_verifier,
+            max_age=600,
+            httponly=True,
+            samesite='Lax',
+        )
         return resp
 
     except Exception as e:
@@ -464,18 +576,16 @@ def google_callback():
         if not code_verifier:
             code_verifier = request.cookies.get('pkce_code_verifier') or None
 
-        # ── Exchange code for session ────────────────────────────────────
-        exchange_payload = {'auth_code': code}
-        if code_verifier:
-            exchange_payload['code_verifier'] = code_verifier
-
+        # ── Exchange code for session (HTTP, not SDK, to keep admin client clean) ──
+        supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+        service_key  = current_app.config.get('SUPABASE_SECRET_KEY', '')
         try:
-            response = supabase.auth.exchange_code_for_session(exchange_payload)
+            response = _exchange_code_http(supabase_url, service_key, code, code_verifier)
         except Exception as e:
             return jsonify({'error': f'Code exchange failed: {str(e)}'}), 401
 
-        user = getattr(response, 'user', None)
-        session = getattr(response, 'session', None)
+        user    = response.user
+        session = response.session
 
         if not user or not session:
             return jsonify({'error': 'Failed to exchange code for session'}), 401
@@ -487,11 +597,11 @@ def google_callback():
 
         # ── Bootstrap tenant on first Google sign-in ─────────────────────
         # Fatal if it fails — without tenant_id every protected API returns 403.
-        # Note: no session re-issue needed because require_auth calls
-        # supabase.auth.get_user(token) which reads live DB metadata, not JWT claims.
+        google_bootstrapped = False
         if not tenant_id:
             tenant_id = str(uuid.uuid4())
             role = 'admin'
+            google_bootstrapped = True
             existing_providers = app_metadata.get('providers') or []
             if isinstance(existing_providers, str):
                 existing_providers = [existing_providers]
@@ -533,6 +643,14 @@ def google_callback():
                     'error': f'Failed to set up tenant for Google account: {err}'
                 }), 500
 
+        # After bootstrap the original JWT has no tenant_id in its claims.
+        # Refresh to get a new JWT that includes the updated metadata so that
+        # Supabase RLS policies work immediately without requiring a second login.
+        new_tok = _refresh_session_tokens(session) if google_bootstrapped else None
+
+        def _gtok(field, fallback):
+            return (new_tok or {}).get(field) or getattr(session, field, fallback)
+
         # ── Lazy Pinecone init (same as email signin) ─────────────────────
         if tenant_id:
             pinecone_service = current_app.pinecone_service
@@ -567,12 +685,478 @@ def google_callback():
                 'created_at':         _iso(getattr(user, 'created_at', None)),
             },
             'session': {
-                'access_token':  session.access_token,
-                'refresh_token': session.refresh_token,
-                'expires_at':    session.expires_at,
-                'expires_in':    session.expires_in,
-                'token_type':    session.token_type,
+                'access_token':  _gtok('access_token',  session.access_token),
+                'refresh_token': _gtok('refresh_token', session.refresh_token),
+                'expires_at':    _gtok('expires_at',    session.expires_at),
+                'expires_in':    _gtok('expires_in',    session.expires_in),
+                'token_type':    _gtok('token_type',    session.token_type),
             }
+        }), 200
+
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+
+@auth_bp.route('/azure-signin', methods=['GET'])
+def azure_signin():
+    """
+    Start Microsoft Entra ID (Azure AD) OIDC sign-in via Supabase.
+
+    The OAuth callback is routed through the BACKEND (not the frontend) so the
+    server can exchange the code itself. This avoids the browser-side PKCE
+    mismatch that causes "session=expired" when OAuth is initiated server-side.
+
+    After a successful exchange the backend redirects the browser to:
+        {FRONTEND_URL}/auth/callback#access_token=...&refresh_token=...&...
+
+    ?format=json  — returns JSON { auth_url } instead of a browser redirect.
+                    Useful for testing with curl.
+    """
+    try:
+        now = time.time()
+        expired_keys = [k for k, v in _pkce_store.items() if v['expires_at'] < now]
+        for k in expired_keys:
+            _pkce_store.pop(k, None)
+
+        supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+        if not supabase_url:
+            return jsonify({'error': 'Authentication service not configured'}), 500
+
+        # Redirect back to OUR backend so we can do the code exchange server-side.
+        # The backend then redirects the browser to the frontend with the final tokens.
+        backend_url = current_app.config.get('BACKEND_URL', '').rstrip('/')
+        # In JSON/test mode, embed ?format=json in redirect_to so the callback
+        # returns a JSON response (tokens visible in browser) instead of a frontend redirect.
+        json_mode = request.args.get('format') == 'json'
+        callback_path = '/auth/azure-callback?format=json' if json_mode else '/auth/azure-callback'
+        # Build PKCE pair on the server so callback can always exchange code.
+        # We attach a custom OAuth state value and also store verifier server-side.
+        code_verifier, code_challenge = _generate_pkce_pair()
+        state_id = str(uuid.uuid4())
+        _pkce_store[state_id] = {
+            'code_verifier': code_verifier,
+            'expires_at':    now + 600,
+        }
+
+        # Pass our own PKCE lookup key using a custom query param in redirect_to.
+        # Do NOT use OAuth "state" for this; Supabase uses state internally and
+        # overriding it can trigger bad_oauth_state.
+        redirect_to_with_pkce = f"{backend_url}{callback_path}"
+        joiner = '&' if '?' in redirect_to_with_pkce else '?'
+        redirect_to_with_pkce = f"{redirect_to_with_pkce}{joiner}pkce_state={urllib.parse.quote(state_id)}"
+
+        params = {
+            'provider': 'azure',
+            'redirect_to': redirect_to_with_pkce,
+            'scope': 'openid email profile offline_access',
+            'code_challenge': code_challenge,
+            'code_challenge_method': 's256',
+        }
+        auth_url = f"{supabase_url}/auth/v1/authorize?{urllib.parse.urlencode(params)}"
+
+        if json_mode:
+            return jsonify({
+                'message': 'Open auth_url in a browser to start Microsoft sign-in. '
+                           'After authenticating, the browser will show your access_token as JSON.',
+                'auth_url': auth_url,
+                'pkce_state': state_id,
+            }), 200
+
+        resp = make_response(redirect(auth_url, code=302))
+        # Cookie lets the GET callback retrieve verifier in normal browser flow.
+        resp.set_cookie(
+            'azure_pkce_state',
+            state_id,
+            max_age=600,
+            httponly=True,
+            samesite='Lax',
+        )
+        return resp
+
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+
+def _refresh_session_tokens(original_session):
+    """
+    After writing tenant_id into user_metadata/app_metadata via the admin API,
+    the original JWT still reflects the old (pre-bootstrap) state.  Calling this
+    forces Supabase to issue a brand-new JWT that embeds the updated metadata so
+    that RLS policies (which read auth.jwt()) work immediately.
+
+    Returns a plain dict with the new token fields, or None if the refresh fails
+    (caller should fall back to original_session in that case).
+    """
+    supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+    service_key  = current_app.config.get('SUPABASE_SECRET_KEY', '')
+    refresh_token = getattr(original_session, 'refresh_token', None)
+
+    if not refresh_token:
+        return None
+
+    try:
+        resp = http_requests.post(
+            f"{supabase_url}/auth/v1/token?grant_type=refresh_token",
+            json={'refresh_token': refresh_token},
+            headers={
+                'apikey':        service_key,
+                'Content-Type':  'application/json',
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        print(f"[auth] session refresh HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[auth] session refresh failed: {e}")
+
+    return None
+
+
+def _resolve_azure_email(user, user_metadata):
+    """
+    Microsoft sometimes returns an empty email in the OIDC token even when
+    preferred_username holds the actual address. This function:
+      1. Returns user.email if it is non-empty.
+      2. Otherwise falls back to preferred_username / email from user_metadata.
+      3. Patches the Supabase auth record so the user is visible in the dashboard.
+
+    Returns the resolved email string (may still be '' if Microsoft gave nothing).
+    """
+    email = (getattr(user, 'email', '') or '').strip()
+    if email:
+        return email
+
+    # Try common Microsoft OIDC claim aliases
+    fallback = (
+        user_metadata.get('preferred_username') or
+        user_metadata.get('email') or
+        user_metadata.get('upn') or
+        ''
+    ).strip()
+
+    if not fallback:
+        return ''
+
+    # Patch the Supabase user record so the dashboard shows the email
+    try:
+        supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+        service_key  = current_app.config.get('SUPABASE_SECRET_KEY', '')
+        http_requests.put(
+            f"{supabase_url}/auth/v1/admin/users/{user.id}",
+            json={'email': fallback, 'email_confirm': True},
+            headers={
+                'Authorization': f'Bearer {service_key}',
+                'apikey':        service_key,
+                'Content-Type':  'application/json',
+            },
+            timeout=10,
+        )
+        print(f"[azure] patched empty email → {fallback} for user {user.id}")
+    except Exception as patch_err:
+        print(f"[azure] email patch failed for user {user.id}: {patch_err}")
+
+    return fallback
+
+
+def _bootstrap_azure_tenant(user, user_metadata, app_metadata):
+    """
+    Assign a new tenant_id + admin role to a first-time Microsoft sign-in user.
+    Returns (tenant_id, role) or raises on failure.
+    """
+    tenant_id = str(uuid.uuid4())
+    role = 'admin'
+    existing_providers = app_metadata.get('providers') or []
+    if isinstance(existing_providers, str):
+        existing_providers = [existing_providers]
+
+    updated_user_metadata = {**user_metadata, 'tenant_id': tenant_id, 'role': role}
+    updated_app_metadata  = {
+        **app_metadata,
+        'provider':  'azure',
+        'providers': sorted(set(existing_providers + ['azure'])),
+        'tenant_id': tenant_id,
+        'role':      role,
+    }
+
+    supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+    service_key  = current_app.config.get('SUPABASE_SECRET_KEY', '')
+
+    put_resp = http_requests.put(
+        f"{supabase_url}/auth/v1/admin/users/{user.id}",
+        json={
+            'user_metadata': updated_user_metadata,
+            'app_metadata':  updated_app_metadata,
+        },
+        headers={
+            'Authorization': f'Bearer {service_key}',
+            'apikey':        service_key,
+            'Content-Type':  'application/json',
+        },
+        timeout=10,
+    )
+
+    if put_resp.status_code not in (200, 201):
+        try:
+            err = put_resp.json().get('message') or put_resp.text
+        except Exception:
+            err = put_resp.text or f'HTTP {put_resp.status_code}'
+        raise RuntimeError(f'Failed to set up tenant for Microsoft account: {err}')
+
+    return tenant_id, role
+
+
+def _lazy_pinecone_init(tenant_id):
+    """Create a Pinecone index for the tenant if one doesn't exist yet."""
+    pinecone_service = current_app.pinecone_service
+    if not pinecone_service:
+        return
+    try:
+        db_result = (
+            current_app.supabase_client
+            .table('tenants')
+            .select('pinecone_index_name')
+            .eq('id', tenant_id)
+            .execute()
+        )
+        already_provisioned = db_result.data and db_result.data[0].get('pinecone_index_name')
+        if not already_provisioned:
+            pinecone_service.create_tenant_index(tenant_id, store_in_db=True)
+    except Exception as pinecone_error:
+        print(f"⚠️  Pinecone lazy-init failed for tenant {tenant_id}: {pinecone_error}")
+
+
+@auth_bp.route('/azure-callback', methods=['GET'])
+def azure_callback_redirect():
+    """
+    GET — called by Supabase after Microsoft authenticates the user.
+
+    Supabase redirects the browser here with ?code=... (and optionally ?error=...).
+    We exchange the code for a Supabase session, bootstrap the tenant when needed,
+    and then redirect the browser to the frontend with the session tokens in the
+    URL fragment so the frontend can store them exactly as it does for other providers.
+
+    Frontend destination:
+        {FRONTEND_URL}/auth/callback#access_token=...&refresh_token=...&tenant_id=...&role=...
+    """
+    frontend_url = current_app.config.get('FRONTEND_URL', '').rstrip('/')
+    json_mode = request.args.get('format') == 'json'
+
+    def _error_redirect(msg):
+        if json_mode:
+            return jsonify({'error': msg}), 400
+        return redirect(
+            f"{frontend_url}/auth/callback?error={urllib.parse.quote(msg)}",
+            code=302,
+        )
+
+    try:
+        error = request.args.get('error', '')
+        if error:
+            desc = request.args.get('error_description', error)
+            return _error_redirect(desc)
+
+        code = request.args.get('code', '').strip()
+        if not code:
+            return _error_redirect('missing_code')
+
+        supabase = current_app.supabase_client
+        if not supabase:
+            return _error_redirect('service_unavailable')
+
+        # Recover PKCE verifier from:
+        # 1) cookie state (browser redirect flow), or
+        # 2) query pkce_state (format=json flow where auth_url is opened directly)
+        code_verifier = None
+        state_id = request.cookies.get('azure_pkce_state', '') or request.args.get('pkce_state', '').strip()
+        if state_id:
+            entry = _pkce_store.pop(state_id, None)
+            if entry and entry['expires_at'] > time.time():
+                code_verifier = entry['code_verifier']
+
+        supabase_url_cfg = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+        service_key_cfg  = current_app.config.get('SUPABASE_SECRET_KEY', '')
+        try:
+            response = _exchange_code_http(supabase_url_cfg, service_key_cfg, code, code_verifier)
+        except Exception as e:
+            return _error_redirect(f'exchange_failed: {str(e)}')
+
+        user    = response.user
+        session = response.session
+        if not user or not session:
+            return _error_redirect('no_session')
+
+        user_metadata = getattr(user, 'user_metadata', {}) or {}
+        app_metadata  = getattr(user, 'app_metadata',  {}) or {}
+        tenant_id = user_metadata.get('tenant_id') or app_metadata.get('tenant_id')
+        role      = user_metadata.get('role')      or app_metadata.get('role') or 'user'
+
+        # Resolve email — Microsoft may return empty email; fall back to preferred_username
+        resolved_email = _resolve_azure_email(user, user_metadata)
+
+        bootstrapped = False
+        if not tenant_id:
+            try:
+                tenant_id, role = _bootstrap_azure_tenant(user, user_metadata, app_metadata)
+                bootstrapped = True
+            except RuntimeError as e:
+                return _error_redirect(str(e))
+
+        # After bootstrap the original JWT has no tenant_id in its claims yet.
+        # Refresh the session so the new JWT embeds the updated metadata and
+        # Supabase RLS policies (which read auth.jwt()) work immediately.
+        if bootstrapped:
+            new_tok = _refresh_session_tokens(session)
+        else:
+            new_tok = None
+
+        def _tok(field, fallback):
+            return (new_tok or {}).get(field) or getattr(session, field, fallback)
+
+        _lazy_pinecone_init(tenant_id)
+
+        def _iso(val):
+            if not val:
+                return None
+            return val.isoformat() if hasattr(val, 'isoformat') else str(val)
+
+        # JSON mode — return tokens as JSON (same shape as POST /auth/signin)
+        # Triggered when redirect_to had ?format=json embedded (curl / API testing)
+        if request.args.get('format') == 'json':
+            resp = jsonify({
+                'message': 'Microsoft sign-in successful',
+                'user': {
+                    'id':                 user.id,
+                    'email':              resolved_email,
+                    'tenant_id':          tenant_id,
+                    'role':               role,
+                    'email_confirmed_at': _iso(getattr(user, 'email_confirmed_at', None)),
+                    'created_at':         _iso(getattr(user, 'created_at', None)),
+                },
+                'session': {
+                    'access_token':  _tok('access_token',  session.access_token),
+                    'refresh_token': _tok('refresh_token', session.refresh_token),
+                    'expires_at':    _tok('expires_at',    session.expires_at),
+                    'expires_in':    _tok('expires_in',    session.expires_in),
+                    'token_type':    _tok('token_type',    session.token_type),
+                },
+            })
+            resp.delete_cookie('azure_pkce_state')
+            return resp, 200
+
+        # Browser mode — redirect to frontend with tokens in URL fragment
+        # (frontend reads window.location.hash and stores them)
+        fragment = urllib.parse.urlencode({
+            'access_token':  _tok('access_token',  session.access_token),
+            'refresh_token': _tok('refresh_token', session.refresh_token),
+            'expires_in':    _tok('expires_in',    session.expires_in),
+            'token_type':    _tok('token_type',    session.token_type),
+            'tenant_id':     tenant_id,
+            'role':          role,
+        })
+        resp = redirect(f"{frontend_url}/auth/callback#{fragment}", code=302)
+        resp.delete_cookie('azure_pkce_state')
+        return resp
+
+    except Exception as e:
+        return _error_redirect(f'internal_error: {str(e)}')
+
+
+@auth_bp.route('/azure-callback', methods=['POST'])
+def azure_callback_api():
+    """
+    POST — direct API endpoint for testing or custom frontend integrations.
+
+    Accepts a raw authorization code and returns a JSON session (same shape as
+    POST /auth/signin). Use this when the frontend handles the code redirect
+    itself instead of relying on the GET handler above.
+
+    Body (pick one):
+        { "code": "...", "state": "<state_id from server-side PKCE store>" }
+        { "code": "...", "code_verifier": "<raw PKCE verifier>" }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Request body is required'}), 400
+
+        code = (data.get('code') or '').strip()
+        if not code:
+            return jsonify({'error': 'code is required'}), 400
+
+        supabase = current_app.supabase_client
+        if not supabase:
+            return jsonify({'error': 'Authentication service not configured'}), 500
+
+        # Resolve code_verifier: body > state_id lookup > cookie
+        code_verifier = (data.get('code_verifier') or '').strip() or None
+        if not code_verifier:
+            state_id = (data.get('state') or '').strip()
+            if state_id:
+                entry = _pkce_store.pop(state_id, None)
+                if entry and entry['expires_at'] > time.time():
+                    code_verifier = entry['code_verifier']
+        if not code_verifier:
+            code_verifier = request.cookies.get('pkce_code_verifier') or None
+
+        supabase_url_a = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+        service_key_a  = current_app.config.get('SUPABASE_SECRET_KEY', '')
+        try:
+            response = _exchange_code_http(supabase_url_a, service_key_a, code, code_verifier)
+        except Exception as e:
+            return jsonify({'error': f'Code exchange failed: {str(e)}'}), 401
+
+        user    = response.user
+        session = response.session
+        if not user or not session:
+            return jsonify({'error': 'Failed to exchange code for session'}), 401
+
+        user_metadata = getattr(user, 'user_metadata', {}) or {}
+        app_metadata  = getattr(user, 'app_metadata',  {}) or {}
+        tenant_id = user_metadata.get('tenant_id') or app_metadata.get('tenant_id')
+        role      = user_metadata.get('role')      or app_metadata.get('role') or 'user'
+
+        # Resolve email — Microsoft may return empty email; fall back to preferred_username
+        resolved_email = _resolve_azure_email(user, user_metadata)
+
+        bootstrapped = False
+        if not tenant_id:
+            try:
+                tenant_id, role = _bootstrap_azure_tenant(user, user_metadata, app_metadata)
+                bootstrapped = True
+            except RuntimeError as e:
+                return jsonify({'error': str(e)}), 500
+
+        # Refresh session after bootstrap so the new JWT embeds tenant_id in claims
+        new_tok = _refresh_session_tokens(session) if bootstrapped else None
+
+        def _tok(field, fallback):
+            return (new_tok or {}).get(field) or getattr(session, field, fallback)
+
+        _lazy_pinecone_init(tenant_id)
+
+        def _iso(val):
+            if not val:
+                return None
+            return val.isoformat() if hasattr(val, 'isoformat') else str(val)
+
+        return jsonify({
+            'message': 'Microsoft sign-in successful',
+            'user': {
+                'id':                 user.id,
+                'email':              resolved_email,
+                'tenant_id':          tenant_id,
+                'role':               role,
+                'email_confirmed_at': _iso(getattr(user, 'email_confirmed_at', None)),
+                'created_at':         _iso(getattr(user, 'created_at', None)),
+            },
+            'session': {
+                'access_token':  _tok('access_token',  session.access_token),
+                'refresh_token': _tok('refresh_token', session.refresh_token),
+                'expires_at':    _tok('expires_at',    session.expires_at),
+                'expires_in':    _tok('expires_in',    session.expires_in),
+                'token_type':    _tok('token_type',    session.token_type),
+            },
         }), 200
 
     except Exception as e:
@@ -622,7 +1206,7 @@ def verify_email_token(token):
                 email_service.send_welcome_email(email)
 
             frontend_url = current_app.config.get('FRONTEND_URL', '').rstrip('/')
-            return redirect(f"{frontend_url}/create-tenant", code=302)
+            return redirect(frontend_url or '/', code=302)
             
         except Exception as e:
             error_msg = str(e)
