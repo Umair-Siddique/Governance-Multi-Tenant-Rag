@@ -1194,11 +1194,28 @@ def verify_email_token(token):
             if not user_id:
                 return jsonify({'error': 'Could not resolve user account'}), 500
 
-            # Update user to confirm email
-            supabase.auth.admin.update_user_by_id(
-                user_id,
-                {'email_confirm': True}
+            # Confirm email via direct GoTrue admin REST.
+            # Avoid supabase.auth.admin.update_user_by_id(), which can trigger
+            # "User not allowed" in some Supabase/client auth-state scenarios.
+            supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+            service_key = current_app.config.get('SUPABASE_SECRET_KEY', '')
+            resp = http_requests.put(
+                f"{supabase_url}/auth/v1/admin/users/{user_id}",
+                json={'email_confirm': True},
+                headers={
+                    'Authorization': f'Bearer {service_key}',
+                    'apikey': service_key,
+                    'Content-Type': 'application/json',
+                },
+                timeout=10,
             )
+
+            if resp.status_code not in (200, 201):
+                try:
+                    err = resp.json().get('message') or resp.text
+                except Exception:
+                    err = resp.text or f'HTTP {resp.status_code}'
+                return jsonify({'error': f'Failed to verify email: {err}'}), 400
             
             # Send welcome email
             email_service = current_app.email_service
