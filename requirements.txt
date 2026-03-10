@@ -9,3 +9,7 @@ anthropic
 mistralai
 pinecone
 gunicorn
+pypdf
+python-docx
+pytesseract
+pillow

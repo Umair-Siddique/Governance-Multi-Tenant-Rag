@@ -110,3 +110,72 @@ CREATE POLICY "Tenant isolation for authenticated users"
     WITH CHECK (
         tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
     );
+
+-- ============================================================
+-- Documents (CMS content with Draft → Review → Approved lifecycle)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS documents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    filename VARCHAR(500) NOT NULL,
+    file_type VARCHAR(50) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft', 'review', 'approved')),
+    uploaded_by UUID NOT NULL,
+    raw_text TEXT,
+    chunk_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS documents_tenant_status_idx ON documents (tenant_id, status);
+
+-- Enable RLS
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Tenant isolation for documents" ON documents;
+CREATE POLICY "Tenant isolation for documents"
+    ON documents
+    FOR ALL
+    TO authenticated
+    USING (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    )
+    WITH CHECK (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    );
+
+-- ============================================================
+-- Document Chunks (for reviewer to view all chunks before approval)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS document_chunks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id UUID NOT NULL,
+    tenant_id UUID NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    char_count INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+    UNIQUE(document_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS document_chunks_document_idx ON document_chunks (document_id);
+CREATE INDEX IF NOT EXISTS document_chunks_tenant_idx ON document_chunks (tenant_id);
+
+-- Enable RLS
+ALTER TABLE document_chunks ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Tenant isolation for document_chunks" ON document_chunks;
+CREATE POLICY "Tenant isolation for document_chunks"
+    ON document_chunks
+    FOR ALL
+    TO authenticated
+    USING (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    )
+    WITH CHECK (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    );

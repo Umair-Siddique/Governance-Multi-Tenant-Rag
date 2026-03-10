@@ -1,13 +1,27 @@
 import os
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _default_tesseract_cmd():
+    """Tesseract path: from env, or on Windows only default to local install."""
+    cmd = os.getenv("TESSERACT_CMD")
+    if cmd is not None and cmd.strip():
+        return cmd.strip()
+    # Production (e.g. Render): leave unset so pytesseract uses system tesseract from PATH
+    if sys.platform == "win32":
+        return os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Tesseract-OCR", "tesseract.exe")
+    return None
+
 
 class Config:
     SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
     ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     
     # Secret key for token signing (can use same as Supabase or generate a new one)
     SECRET_KEY = os.getenv("SECRET_KEY", os.getenv("SUPABASE_SECRET_KEY"))
@@ -29,3 +43,6 @@ class Config:
     AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
     # e.g. https://login.microsoftonline.com/common/v2.0  (or a single-tenant URL)
     AZURE_TENANT_URL = os.getenv("AZURE_TENANT_URL", "https://login.microsoftonline.com/common")
+
+    # Tesseract OCR: set TESSERACT_CMD in .env to override. On Windows, defaults to Program Files path when unset; on Render/Linux leave unset to use system tesseract from PATH.
+    TESSERACT_CMD = _default_tesseract_cmd()

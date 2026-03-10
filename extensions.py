@@ -4,6 +4,7 @@ from utils.email_service import EmailService
 from utils.token_service import TokenService
 from utils.encryption_service import EncryptionService
 from utils.pinecone_service import PineconeService
+from openai import OpenAI
 
 
 def init_supabase(app):
@@ -64,3 +65,8 @@ def init_pinecone_service(app):
     else:
         app.pinecone_service = None
         print("⚠️  Pinecone not configured - vector database disabled")
+
+
+def init_openai_service(app):
+    """Initialize OpenAI Service"""
+    app.openai_service = OpenAI(api_key=Config.OPENAI_API_KEY)

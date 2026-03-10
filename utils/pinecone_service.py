@@ -29,7 +29,7 @@ class PineconeService:
         self.pc = Pinecone(api_key=self.api_key)
         self.dimension = 1536  # OpenAI embedding dimension
         self.metric = "cosine"
-        self.region = "eu-west-1"  # Europe region
+        self.region = "us-east-1"  # Europe region
         self.cloud = "aws"
     
     def get_tenant_index_name(self, tenant_id: str) -> str:
@@ -262,6 +262,46 @@ class PineconeService:
         
         return self.pc.Index(index_name)
     
+    def upsert_vectors(
+        self,
+        tenant_id: str,
+        vectors: list[dict],
+    ) -> dict:
+        """
+        Upsert vectors into the tenant's Pinecone index.
+        Ensures index exists before upserting.
+
+        Args:
+            tenant_id: Unique tenant identifier
+            vectors: List of dicts with keys: id (str), values (list[float]), metadata (dict).
+                     Metadata values must be str, int, float, bool, or list of str.
+
+        Returns:
+            Pinecone upsert response with upserted_count
+
+        Raises:
+            Exception: If index doesn't exist or upsert fails
+        """
+        self.create_tenant_index(tenant_id, store_in_db=True)
+        index = self.get_index(tenant_id)
+
+        if not vectors:
+            return {"upserted_count": 0}
+
+        # Pinecone recommends batching up to 100 vectors per upsert
+        batch_size = 100
+        total_upserted = 0
+        for i in range(0, len(vectors), batch_size):
+            batch = vectors[i : i + batch_size]
+            result = index.upsert(vectors=batch)
+            if hasattr(result, "upserted_count"):
+                total_upserted += result.upserted_count or 0
+            elif isinstance(result, dict) and "upserted_count" in result:
+                total_upserted += result["upserted_count"] or 0
+
+        logger.info(f"Upserted {len(vectors)} vectors to tenant {tenant_id} index")
+        return {"upserted_count": len(vectors)}
+
     def delete_tenant_index(self, tenant_id: str) -> bool:
         """
         Delete a tenant's Pinecone index
