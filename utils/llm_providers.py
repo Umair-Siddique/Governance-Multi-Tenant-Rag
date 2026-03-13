@@ -6,7 +6,10 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 import openai
 import anthropic
-from mistralai import Mistral
+try:
+    from mistralai import Mistral
+except ImportError:
+    Mistral = None  # or handle gracefully
 
 
 class LLMProvider(ABC):
