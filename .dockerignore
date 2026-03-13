@@ -1,0 +1,28 @@
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# IDE / editor
+.vscode/
+.idea/
+.DS_Store
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Render / local artifacts
+*.log
+
+

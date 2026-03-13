@@ -42,7 +42,11 @@ class Config:
     AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
     AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
     # e.g. https://login.microsoftonline.com/common/v2.0  (or a single-tenant URL)
-    AZURE_TENANT_URL = os.getenv("AZURE_TENANT_URL", "https://login.microsoftonline.com/common")
+    AZURE_TENANT_URL = os.getenv("AZURE_TENANT_URL")
 
     # Tesseract OCR: set TESSERACT_CMD in .env to override. On Windows, defaults to Program Files path when unset; on Render/Linux leave unset to use system tesseract from PATH.
     TESSERACT_CMD = _default_tesseract_cmd()
+
+    # Celery configuration
+    CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
+    CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")

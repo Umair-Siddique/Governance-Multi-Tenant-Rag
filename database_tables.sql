@@ -120,16 +120,19 @@ CREATE TABLE IF NOT EXISTS documents (
     filename VARCHAR(500) NOT NULL,
     file_type VARCHAR(50) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'draft'
-        CHECK (status IN ('draft', 'review', 'approved')),
+        CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed')),
     uploaded_by UUID NOT NULL,
     raw_text TEXT,
     chunk_count INTEGER DEFAULT 0,
+    storage_path VARCHAR(1000),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS documents_tenant_status_idx ON documents (tenant_id, status);
+CREATE INDEX IF NOT EXISTS documents_pending_processing_idx ON documents (tenant_id, status) 
+    WHERE status = 'pending_processing';
 
 -- Enable RLS
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
@@ -171,6 +174,80 @@ ALTER TABLE document_chunks ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Tenant isolation for document_chunks" ON document_chunks;
 CREATE POLICY "Tenant isolation for document_chunks"
     ON document_chunks
+    FOR ALL
+    TO authenticated
+    USING (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    )
+    WITH CHECK (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    );
+
+-- ============================================================
+-- CSV Registry (Metadata Catalog for CSV files)
+-- Stores file metadata and LLM-generated summary; no raw rows.
+-- Bridges with Pinecone via file_id in vector metadata.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS csv_registry (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    filename VARCHAR(500) NOT NULL,
+    columns JSONB NOT NULL DEFAULT '[]'::jsonb,
+    summary TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed')),
+    uploaded_by UUID NOT NULL,
+    row_count INTEGER DEFAULT 0,
+    chunk_count INTEGER DEFAULT 0,
+    storage_path VARCHAR(1000),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS csv_registry_tenant_status_idx ON csv_registry (tenant_id, status);
+CREATE INDEX IF NOT EXISTS csv_registry_pending_processing_idx ON csv_registry (tenant_id, status) 
+    WHERE status = 'pending_processing';
+
+ALTER TABLE csv_registry ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Tenant isolation for csv_registry" ON csv_registry;
+CREATE POLICY "Tenant isolation for csv_registry"
+    ON csv_registry
+    FOR ALL
+    TO authenticated
+    USING (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    )
+    WITH CHECK (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+    );
+
+-- ============================================================
+-- CSV Chunks (row-group text for embedding; links to Pinecone)
+-- Each chunk = searchable text for a group of rows (for embedding).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS csv_chunks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    csv_file_id UUID NOT NULL,
+    tenant_id UUID NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    char_count INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    FOREIGN KEY (csv_file_id) REFERENCES csv_registry(id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+    UNIQUE(csv_file_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS csv_chunks_csv_file_idx ON csv_chunks (csv_file_id);
+CREATE INDEX IF NOT EXISTS csv_chunks_tenant_idx ON csv_chunks (tenant_id);
+
+ALTER TABLE csv_chunks ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Tenant isolation for csv_chunks" ON csv_chunks;
+CREATE POLICY "Tenant isolation for csv_chunks"
+    ON csv_chunks
     FOR ALL
     TO authenticated
     USING (

@@ -1,14 +1,16 @@
 """
 Document text extraction and preprocessing utilities.
-Handles PDF, DOCX, and related formats with normalization and cleaning.
+Handles PDF, DOCX, CSV, and related formats with normalization and cleaning.
 When documents contain images, Tesseract OCR is used to extract text from those images (if available).
+CSV uses column-aware parsing and row-group chunking for Supabase registry + Pinecone search.
 """
+import csv
 import io
 import re
 import zipfile
 import unicodedata
 from pathlib import Path
-from typing import BinaryIO, Iterator, Optional, Union
+from typing import BinaryIO, Iterator, List, Optional, Tuple, Union
 
 from pypdf import PdfReader
 from docx import Document
@@ -26,6 +28,7 @@ except ImportError:
 # --- Supported file extensions ---
 SUPPORTED_PDF_EXTENSIONS = {".pdf"}
 SUPPORTED_DOCX_EXTENSIONS = {".docx"}
+SUPPORTED_CSV_EXTENSIONS = {".csv"}
 
 
 # --- Unicode categories to strip (control, format, surrogate, private-use) ---
@@ -413,8 +416,8 @@ def extract_and_preprocess(
 
 
 def get_supported_extensions() -> set:
-    """Return all supported file extensions for extraction."""
-    return SUPPORTED_PDF_EXTENSIONS | SUPPORTED_DOCX_EXTENSIONS
+    """Return all supported file extensions for extraction (PDF, DOCX, CSV)."""
+    return SUPPORTED_PDF_EXTENSIONS | SUPPORTED_DOCX_EXTENSIONS | SUPPORTED_CSV_EXTENSIONS
 
 
 def is_supported(filename_or_ext: str) -> bool:
@@ -423,6 +426,154 @@ def is_supported(filename_or_ext: str) -> bool:
     if not ext.startswith("."):
         ext = Path(ext).suffix.lower() if "." in ext else f".{ext}"
     return ext in get_supported_extensions()
+
+
+# --- CSV: column-aware parsing and row-group chunking ---
+def _normalize_csv_cell(value: str) -> str:
+    """Normalize a single CSV cell: strip and collapse internal whitespace."""
+    if not value:
+        return ""
+    return " ".join((value or "").strip().split())
+
+
+def parse_csv(
+    source: Union[str, Path, bytes, BinaryIO],
+    max_rows: Optional[int] = None,
+    encoding: str = "utf-8",
+    delimiter: Optional[str] = None,
+) -> Tuple[List[str], List[dict]]:
+    """
+    Parse CSV with column-aware handling. Returns column names and list of row dicts.
+
+    Args:
+        source: File path, bytes, or file-like object.
+        max_rows: If set, only read this many data rows (after header).
+        encoding: Text encoding (default utf-8).
+        delimiter: CSV delimiter; if None, sniffed (comma or tab).
+
+    Returns:
+        (columns, rows) where columns is list of header strings, rows is list of dicts
+        with normalized string values.
+    """
+    if isinstance(source, (str, Path)):
+        with open(source, "r", encoding=encoding, newline="") as f:
+            text = f.read()
+    elif isinstance(source, bytes):
+        text = source.decode(encoding)
+    elif hasattr(source, "read"):
+        raw = source.read()
+        text = raw.decode(encoding) if isinstance(raw, bytes) else raw
+    else:
+        raise TypeError("source must be path, bytes, or file-like object")
+
+    if delimiter is None:
+        try:
+            dialect = csv.Sniffer().sniff(text[:8192], delimiters=",\t;")
+            delimiter = dialect.delimiter
+        except (csv.Error, TypeError):
+            delimiter = ","
+
+    f = io.StringIO(text)
+    reader = csv.DictReader(f, delimiter=delimiter)
+    columns = [c for c in (reader.fieldnames or []) if c]
+    if not columns:
+        return [], []
+    rows = []
+    for i, row in enumerate(reader):
+        if max_rows is not None and i >= max_rows:
+            break
+        normalized = {k: _normalize_csv_cell(str(row.get(k, ""))) for k in columns}
+        rows.append(normalized)
+    return columns, rows
+
+
+def csv_rows_to_chunks(
+    columns: List[str],
+    rows: List[dict],
+    chunk_size: int = 2000,
+    rows_per_chunk: Optional[int] = None,
+) -> List[str]:
+    """
+    Turn CSV rows into searchable text chunks for embedding.
+    Each chunk is a text block of "column: value" lines for a group of rows.
+
+    Args:
+        columns: Column names.
+        rows: List of row dicts (same keys as columns).
+        chunk_size: Target max characters per chunk if rows_per_chunk not set.
+        rows_per_chunk: If set, each chunk contains exactly this many rows (except last).
+
+    Returns:
+        List of chunk strings.
+    """
+    if not columns or not rows:
+        return []
+
+    def row_to_line(row: dict) -> str:
+        parts = [f"{col}: {row.get(col, '')}" for col in columns]
+        return " | ".join(parts)
+
+    if rows_per_chunk is not None and rows_per_chunk > 0:
+        out = []
+        for i in range(0, len(rows), rows_per_chunk):
+            group = rows[i : i + rows_per_chunk]
+            out.append("\n".join(row_to_line(r) for r in group))
+        return out
+
+    chunks = []
+    current_lines = []
+    current_len = 0
+    sep_len = 1
+
+    for row in rows:
+        line = row_to_line(row)
+        line_len = len(line) + sep_len
+        if current_lines and current_len + line_len > chunk_size:
+            chunks.append("\n".join(current_lines))
+            current_lines = [line]
+            current_len = line_len
+        else:
+            current_lines.append(line)
+            current_len += line_len
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+    return chunks
+
+
+def generate_csv_summary_with_llm(
+    columns: List[str],
+    rows: List[dict],
+    openai_client,
+    max_sample_rows: int = 20,
+    max_summary_chars: int = 2000,
+) -> str:
+    """
+    Generate a short summary of the CSV using LLM (for csv_registry.summary).
+    Uses only column names and a small sample of rows; no interpretation or advice.
+    """
+    if not openai_client or not columns:
+        return ""
+    sample = rows[:max_sample_rows]
+    sample_text = "\n".join(
+        " | ".join(str(r.get(c, "")) for c in columns) for r in sample
+    )
+    prompt = (
+        "You are a data cataloguer. Based only on the column names and the sample rows below, "
+        "write a brief factual summary (2–4 sentences) of what this dataset contains. "
+        "Do not add interpretation, advice, or information not present in the data.\n\n"
+        f"Columns: {', '.join(columns)}\n\nSample rows:\n{sample_text}"
+    )
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+        )
+        summary = (resp.choices[0].message.content or "").strip()
+        return summary[:max_summary_chars] if summary else ""
+    except Exception:
+        return ""
 
 
 # --- Recursive text chunking ---

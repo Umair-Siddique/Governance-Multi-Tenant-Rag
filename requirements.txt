@@ -13,3 +13,5 @@ pypdf
 python-docx
 pytesseract
 pillow
+celery
+redis

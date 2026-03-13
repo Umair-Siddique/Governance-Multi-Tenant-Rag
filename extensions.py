@@ -5,6 +5,7 @@ from utils.token_service import TokenService
 from utils.encryption_service import EncryptionService
 from utils.pinecone_service import PineconeService
 from openai import OpenAI
+from celery import Celery
 
 
 def init_supabase(app):
@@ -70,3 +71,31 @@ def init_pinecone_service(app):
 def init_openai_service(app):
     """Initialize OpenAI Service"""
     app.openai_service = OpenAI(api_key=Config.OPENAI_API_KEY)
+
+
+def init_celery(app):
+    """Initialize Celery"""
+    celery = Celery(
+        app.import_name,
+        broker=Config.CELERY_BROKER_URL,
+        backend=Config.CELERY_RESULT_BACKEND,
+    )
+    celery.conf.update(
+        task_serializer='json',
+        accept_content=['json'],
+        result_serializer='json',
+        timezone='UTC',
+        enable_utc=True,
+    )
+    
+    # Make Celery use Flask app context
+    class ContextTask(celery.Task):
+        def __call__(self, *args, **kwargs):
+            with app.app_context():
+                return self.run(*args, **kwargs)
+    
+    celery.Task = ContextTask
+    app.celery = celery
+    
+    print("✅ Celery initialized successfully")
+    return celery
