@@ -61,39 +61,101 @@ def get_task_status(task_id: str, **kwargs):
     Returns:
         task_id, status (PENDING, STARTED, SUCCESS, FAILURE), result (if completed), error (if failed)
     """
-    celery_app = current_app.celery
+    # Use the same Celery instance that creates the tasks (from tasks.document_tasks)
+    from tasks.document_tasks import celery as task_celery
+    
+    # Fallback to app.celery if task_celery is not initialized
+    celery_app = task_celery if task_celery is not None else current_app.celery
+    
+    if not celery_app:
+        return jsonify({
+            'task_id': task_id,
+            'status': 'ERROR',
+            'error': 'Celery not initialized'
+        }), 500
+    
     task = celery_app.AsyncResult(task_id)
     
-    if task.state == 'PENDING':
-        response = {
-            'task_id': task_id,
-            'status': 'PENDING',
-            'message': 'Task is waiting to be processed',
-        }
-    elif task.state == 'STARTED':
+    # Get task state and info
+    task_state = task.state
+    task_ready = task.ready()
+    
+    if task_state == 'PENDING':
+        # Check if task is actually pending or if result backend lost it
+        if task_ready:
+            # Task completed but result might be expired
+            try:
+                result = task.result
+                response = {
+                    'task_id': task_id,
+                    'status': 'SUCCESS',
+                    'result': result,
+                    'message': 'Task completed (result retrieved from cache)',
+                }
+            except Exception as e:
+                response = {
+                    'task_id': task_id,
+                    'status': 'PENDING',
+                    'message': 'Task is waiting to be processed or result expired',
+                }
+        else:
+            response = {
+                'task_id': task_id,
+                'status': 'PENDING',
+                'message': 'Task is waiting to be processed',
+            }
+    elif task_state == 'STARTED':
         response = {
             'task_id': task_id,
             'status': 'PROCESSING',
             'message': 'Task is being processed',
         }
-    elif task.state == 'SUCCESS':
-        response = {
-            'task_id': task_id,
-            'status': 'SUCCESS',
-            'result': task.result,
-        }
-    elif task.state == 'FAILURE':
-        response = {
-            'task_id': task_id,
-            'status': 'FAILURE',
-            'error': str(task.info),
-        }
+    elif task_state == 'SUCCESS':
+        try:
+            result = task.result
+            response = {
+                'task_id': task_id,
+                'status': 'SUCCESS',
+                'result': result,
+            }
+        except Exception as e:
+            response = {
+                'task_id': task_id,
+                'status': 'SUCCESS',
+                'message': 'Task completed but result unavailable',
+                'error': str(e),
+            }
+    elif task_state == 'FAILURE':
+        try:
+            error_info = task.info
+            response = {
+                'task_id': task_id,
+                'status': 'FAILURE',
+                'error': str(error_info) if error_info else 'Task failed',
+            }
+        except Exception as e:
+            response = {
+                'task_id': task_id,
+                'status': 'FAILURE',
+                'error': f'Task failed: {str(e)}',
+            }
     else:
-        response = {
-            'task_id': task_id,
-            'status': task.state,
-            'result': task.result if task.ready() else None,
-        }
+        # Handle other states (RETRY, REVOKED, etc.)
+        try:
+            result = task.result if task_ready else None
+            response = {
+                'task_id': task_id,
+                'status': task_state,
+                'result': result,
+                'message': f'Task state: {task_state}',
+            }
+        except Exception as e:
+            response = {
+                'task_id': task_id,
+                'status': task_state,
+                'message': f'Task state: {task_state}',
+                'error': str(e),
+            }
     
     return jsonify(response), 200
 
@@ -127,7 +189,10 @@ def upload_document(**kwargs):
         return jsonify({"error": "Database not configured"}), 500
 
     uploaded_documents = []
+    batch_items = []          # items to hand to the single batch task
     errors = []
+
+    now = datetime.now(timezone.utc).isoformat()
 
     for file in files:
         if not file or not file.filename or file.filename.strip() == "":
@@ -180,9 +245,9 @@ def upload_document(**kwargs):
                 continue
 
             # Create database record with pending_processing status
-            now = datetime.now(timezone.utc).isoformat()
             doc_id = str(uuid.uuid4())
-            
+            file_type = "csv" if ext == ".csv" else ext.lstrip(".")
+
             # For CSV, use csv_registry table
             if ext == ".csv":
                 registry_row = {
@@ -199,23 +264,13 @@ def upload_document(**kwargs):
                     "updated_at": now,
                 }
                 supabase.table("csv_registry").insert(registry_row).execute()
-                
-                # Enqueue processing task
-                from tasks.document_tasks import process_document_from_storage
-                task = process_document_from_storage.delay(
-                    tenant_id=tenant_id,
-                    document_id=doc_id,
-                    storage_path=storage_path,
-                    filename=filename,
-                    file_type="csv",
-                )
             else:
                 # For PDF/DOCX, use documents table
                 doc_row = {
                     "id": doc_id,
                     "tenant_id": tenant_id,
                     "filename": filename,
-                    "file_type": ext.lstrip("."),
+                    "file_type": file_type,
                     "status": "pending_processing",
                     "uploaded_by": user_id,
                     "storage_path": storage_path,
@@ -224,22 +279,18 @@ def upload_document(**kwargs):
                     "updated_at": now,
                 }
                 supabase.table("documents").insert(doc_row).execute()
-                
-                # Enqueue processing task
-                from tasks.document_tasks import process_document_from_storage
-                task = process_document_from_storage.delay(
-                    tenant_id=tenant_id,
-                    document_id=doc_id,
-                    storage_path=storage_path,
-                    filename=filename,
-                    file_type=ext.lstrip("."),
-                )
-            
+
             uploaded_documents.append({
                 "document_id": doc_id,
-                "task_id": task.id,
                 "filename": filename,
+                "file_type": file_type,
                 "status": "pending_processing",
+            })
+            batch_items.append({
+                "document_id": doc_id,
+                "storage_path": storage_path,
+                "filename": filename,
+                "file_type": file_type,
             })
 
         except Exception as e:
@@ -250,9 +301,20 @@ def upload_document(**kwargs):
             })
             continue
 
+    # Dispatch ONE batch task for all successfully uploaded documents
+    batch_task_id = None
+    if batch_items:
+        from tasks.document_tasks import process_document_batch
+        batch_task = process_document_batch.delay(
+            tenant_id=tenant_id,
+            batch_items=batch_items,
+        )
+        batch_task_id = batch_task.id
+
     # Return response with all uploaded documents and any errors
     response = {
         "message": f"Uploaded {len(uploaded_documents)} document(s) to storage and queued for processing",
+        "batch_task_id": batch_task_id,
         "uploaded": uploaded_documents,
         "total_uploaded": len(uploaded_documents),
     }
@@ -276,7 +338,8 @@ def upload_document(**kwargs):
 @require_role("admin", "editor", "reviewer")
 def list_documents(**kwargs):
     """
-    List documents for the tenant. Optional query: ?status=draft|review|approved
+    List all documents (PDF/DOCX) and CSV files for the tenant, combined.
+    Optional query: ?status=draft|review|approved|rejected|pending_processing|processing_failed
     """
     tenant_id = kwargs["tenant_id"]
     status = request.args.get("status", "").strip().lower()
@@ -285,21 +348,41 @@ def list_documents(**kwargs):
     if not supabase:
         return jsonify({"error": "Database not configured"}), 500
 
-    cols = "id, tenant_id, filename, file_type, status, uploaded_by, chunk_count, created_at, updated_at"
-    q = supabase.table("documents").select(cols).eq("tenant_id", tenant_id).order("created_at", desc=True)
-    if status and status in ("draft", "review", "approved"):
-        q = q.eq("status", status)
+    valid_statuses = ("draft", "review", "approved", "rejected", "pending_processing", "processing_failed")
 
-    result = q.execute()
-    items = result.data or []
-    return jsonify({"documents": items})
+    # Query documents table (PDF/DOCX)
+    doc_cols = "id, tenant_id, filename, file_type, status, uploaded_by, chunk_count, rejection_reason, created_at, updated_at"
+    doc_q = supabase.table("documents").select(doc_cols).eq("tenant_id", tenant_id)
+    if status and status in valid_statuses:
+        doc_q = doc_q.eq("status", status)
+    doc_result = doc_q.execute()
+    doc_items = doc_result.data or []
+
+    # Query csv_registry table (CSV) — normalise to same shape
+    csv_cols = "id, tenant_id, filename, status, uploaded_by, chunk_count, rejection_reason, created_at, updated_at"
+    csv_q = supabase.table("csv_registry").select(csv_cols).eq("tenant_id", tenant_id)
+    if status and status in valid_statuses:
+        csv_q = csv_q.eq("status", status)
+    csv_result = csv_q.execute()
+    csv_items = csv_result.data or []
+
+    # Tag CSV rows with file_type so the caller can tell them apart
+    for item in csv_items:
+        item.setdefault("file_type", "csv")
+
+    # Merge and sort by created_at descending
+    all_items = doc_items + csv_items
+    all_items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+
+    return jsonify({"documents": all_items})
 
 
 @document_upload_bp.route("/documents/<document_id>", methods=["GET"])
 @require_role("admin", "editor", "reviewer")
 def get_document(document_id: str, **kwargs):
     """
-    Get document metadata and its chunks (for reviewer to view all chunks).
+    Get document metadata and its chunks.
+    Checks documents table first (PDF/DOCX), then csv_registry (CSV).
     """
     tenant_id = kwargs["tenant_id"]
 
@@ -307,25 +390,43 @@ def get_document(document_id: str, **kwargs):
     if not supabase:
         return jsonify({"error": "Database not configured"}), 500
 
-    doc_cols = "id, tenant_id, filename, file_type, status, uploaded_by, chunk_count, created_at, updated_at"
+    # --- Try documents table first (PDF / DOCX) ---
+    doc_cols = "id, tenant_id, filename, file_type, status, uploaded_by, chunk_count, rejection_reason, created_at, updated_at"
     doc_result = supabase.table("documents").select(doc_cols).eq("id", document_id).eq("tenant_id", tenant_id).execute()
-    if not doc_result.data:
+    if doc_result.data:
+        doc = doc_result.data[0]
+        chunks_result = (
+            supabase.table("document_chunks")
+            .select("id, chunk_index, content, char_count")
+            .eq("document_id", document_id)
+            .eq("tenant_id", tenant_id)
+            .order("chunk_index")
+            .execute()
+        )
+        return jsonify({
+            "document": doc,
+            "chunks": chunks_result.data or [],
+        })
+
+    # --- Fall back to csv_registry (CSV) ---
+    csv_cols = "id, tenant_id, filename, status, uploaded_by, chunk_count, rejection_reason, created_at, updated_at"
+    csv_result = supabase.table("csv_registry").select(csv_cols).eq("id", document_id).eq("tenant_id", tenant_id).execute()
+    if not csv_result.data:
         return jsonify({"error": "Document not found"}), 404
 
-    doc = doc_result.data[0]
+    csv_file = csv_result.data[0]
+    csv_file.setdefault("file_type", "csv")
     chunks_result = (
-        supabase.table("document_chunks")
+        supabase.table("csv_chunks")
         .select("id, chunk_index, content, char_count")
-        .eq("document_id", document_id)
+        .eq("csv_file_id", document_id)
         .eq("tenant_id", tenant_id)
         .order("chunk_index")
         .execute()
     )
-    chunks = chunks_result.data or []
-
     return jsonify({
-        "document": doc,
-        "chunks": chunks,
+        "document": csv_file,
+        "chunks": chunks_result.data or [],
     })
 
 
@@ -333,61 +434,78 @@ def get_document(document_id: str, **kwargs):
 @require_role("admin", "reviewer")
 def bulk_approve_documents(**kwargs):
     """
-    Bulk approve documents. Reviewer can approve documents from draft status.
-    
+    Bulk approve documents (PDF/DOCX) and/or CSV files.
+    Pass a mixed list of IDs — each ID is matched against documents first,
+    then csv_registry. All-IDs-empty approves every draft in both tables.
+
     Request body:
     {
-        "document_ids": ["uuid1", "uuid2", ...]  # Optional: if empty, approves all draft documents
+        "document_ids": ["uuid1", "uuid2", ...]  # Optional: if empty, approves all draft docs+csvs
     }
-    
-    Returns:
-        Count of approved documents and list of approved IDs.
     """
     tenant_id = kwargs["tenant_id"]
     current_user = kwargs["current_user"]
     user_id = current_user["id"]
-    
+
     supabase = current_app.supabase_client
     if not supabase:
         return jsonify({"error": "Database not configured"}), 500
-    
+
     body = request.get_json(silent=True) or {}
     document_ids = body.get("document_ids") or []
-    
+
     now = datetime.now(timezone.utc).isoformat()
-    
-    # Build query for documents to approve
+    approve_payload = {"status": "approved", "updated_at": now}
+
     if document_ids:
-        # Approve specific documents (must be in draft or review status)
-        q = (
+        # Determine which IDs belong to documents vs csv_registry
+        doc_check = supabase.table("documents").select("id").eq("tenant_id", tenant_id).in_("id", document_ids).execute()
+        doc_ids_in_docs = {r["id"] for r in (doc_check.data or [])}
+        csv_ids = [i for i in document_ids if i not in doc_ids_in_docs]
+
+        # Approve matched document IDs
+        doc_result = (
             supabase.table("documents")
-            .update({
-                "status": "approved",
-                "updated_at": now,
-            })
+            .update(approve_payload)
             .eq("tenant_id", tenant_id)
-            .in_("id", document_ids)
+            .in_("id", list(doc_ids_in_docs))
             .in_("status", ["draft", "review"])
-        )
+            .execute()
+        ) if doc_ids_in_docs else None
+
+        # Approve matched CSV IDs
+        csv_result = (
+            supabase.table("csv_registry")
+            .update(approve_payload)
+            .eq("tenant_id", tenant_id)
+            .in_("id", csv_ids)
+            .in_("status", ["draft", "review"])
+            .execute()
+        ) if csv_ids else None
     else:
-        # Approve all draft documents for the tenant
-        q = (
+        # Approve ALL draft items in both tables
+        doc_result = (
             supabase.table("documents")
-            .update({
-                "status": "approved",
-                "updated_at": now,
-            })
+            .update(approve_payload)
             .eq("tenant_id", tenant_id)
             .eq("status", "draft")
+            .execute()
         )
-    
-    result = q.execute()
-    approved_count = len(result.data) if result.data else 0
-    approved_ids = [doc["id"] for doc in result.data] if result.data else []
-    
+        csv_result = (
+            supabase.table("csv_registry")
+            .update(approve_payload)
+            .eq("tenant_id", tenant_id)
+            .eq("status", "draft")
+            .execute()
+        )
+
+    approved_doc_ids = [r["id"] for r in (doc_result.data if doc_result else [])]
+    approved_csv_ids = [r["id"] for r in (csv_result.data if csv_result else [])]
+    approved_ids = approved_doc_ids + approved_csv_ids
+
     return jsonify({
-        "message": f"Approved {approved_count} document(s)",
-        "approved_count": approved_count,
+        "message": f"Approved {len(approved_ids)} document(s)",
+        "approved_count": len(approved_ids),
         "approved_document_ids": approved_ids,
         "action": "bulk_approve",
         "actor": user_id,
@@ -399,63 +517,137 @@ def bulk_approve_documents(**kwargs):
 @require_role("admin", "reviewer")
 def bulk_reject_documents(**kwargs):
     """
-    Bulk reject documents. Rejects documents by deleting them or marking as rejected.
-    For now, we'll delete rejected documents as per governance requirements.
-    
+    Bulk reject documents (PDF/DOCX) and/or CSV files.
+    Pass a mixed list of IDs — each ID is matched against documents first,
+    then csv_registry. Marks them as 'rejected' and stores the rejection reason.
+
     Request body:
     {
-        "document_ids": ["uuid1", "uuid2", ...]  # Required: list of document IDs to reject
+        "document_ids": ["uuid1", "uuid2", ...],  # Required
+        "reason": "Optional rejection reason"
     }
-    
-    Returns:
-        Count of rejected documents and list of rejected IDs.
     """
     tenant_id = kwargs["tenant_id"]
     current_user = kwargs["current_user"]
     user_id = current_user["id"]
-    
+
     supabase = current_app.supabase_client
     if not supabase:
         return jsonify({"error": "Database not configured"}), 500
-    
+
     body = request.get_json(silent=True) or {}
     document_ids = body.get("document_ids") or []
-    
+    reason = (body.get("reason") or "").strip()
+
     if not document_ids:
         return jsonify({"error": "document_ids is required"}), 400
-    
+
     now = datetime.now(timezone.utc).isoformat()
-    
-    # Get documents before deletion for audit
-    docs_to_delete = (
+    reject_payload = {
+        "status": "rejected",
+        "rejection_reason": reason or None,
+        "updated_at": now,
+    }
+
+    # Determine which IDs belong to documents vs csv_registry
+    doc_check = supabase.table("documents").select("id").eq("tenant_id", tenant_id).in_("id", document_ids).execute()
+    doc_ids_in_docs = {r["id"] for r in (doc_check.data or [])}
+    csv_ids = [i for i in document_ids if i not in doc_ids_in_docs]
+
+    # Reject matched document IDs
+    doc_result = (
         supabase.table("documents")
-        .select("id, filename")
+        .update(reject_payload)
         .eq("tenant_id", tenant_id)
-        .in_("id", document_ids)
+        .in_("id", list(doc_ids_in_docs))
         .execute()
-    )
-    
-    rejected_ids = [doc["id"] for doc in docs_to_delete.data] if docs_to_delete.data else []
-    
-    # Delete documents (cascade will delete chunks automatically)
-    if rejected_ids:
-        delete_result = (
-            supabase.table("documents")
-            .delete()
-            .eq("tenant_id", tenant_id)
-            .in_("id", rejected_ids)
-            .execute()
-        )
-    
-    rejected_count = len(rejected_ids)
-    
-    return jsonify({
-        "message": f"Rejected {rejected_count} document(s)",
-        "rejected_count": rejected_count,
+    ) if doc_ids_in_docs else None
+
+    # Reject matched CSV IDs
+    csv_result = (
+        supabase.table("csv_registry")
+        .update(reject_payload)
+        .eq("tenant_id", tenant_id)
+        .in_("id", csv_ids)
+        .execute()
+    ) if csv_ids else None
+
+    rejected_doc_ids = [r["id"] for r in (doc_result.data if doc_result else [])]
+    rejected_csv_ids = [r["id"] for r in (csv_result.data if csv_result else [])]
+    rejected_ids = rejected_doc_ids + rejected_csv_ids
+
+    response = {
+        "message": f"Rejected {len(rejected_ids)} document(s)",
+        "rejected_count": len(rejected_ids),
         "rejected_document_ids": rejected_ids,
         "action": "bulk_reject",
         "actor": user_id,
         "timestamp": now,
+    }
+    if reason:
+        response["reason"] = reason
+
+    return jsonify(response), 200
+
+
+@document_upload_bp.route("/documents/<document_id>", methods=["DELETE"])
+@require_role("admin", "editor")
+def delete_document(document_id: str, **kwargs):
+    """
+    Delete a document (PDF/DOCX) or CSV file and all associated data.
+    Checks documents table first; if not found, checks csv_registry.
+    Deletes: DB record, chunks (cascade), and file from storage.
+    """
+    tenant_id = kwargs["tenant_id"]
+
+    supabase = current_app.supabase_client
+    if not supabase:
+        return jsonify({"error": "Database not configured"}), 500
+
+    # --- Try documents table first (PDF / DOCX) ---
+    doc_result = supabase.table("documents").select("id, filename, storage_path").eq("id", document_id).eq("tenant_id", tenant_id).execute()
+    if doc_result.data:
+        doc = doc_result.data[0]
+        storage_path = doc.get("storage_path")
+
+        if storage_path:
+            try:
+                supabase.storage.from_("elorag-docs").remove([storage_path])
+            except Exception as e:
+                current_app.logger.warning(f"Failed to delete file from storage: {storage_path}, error: {str(e)}")
+
+        delete_result = supabase.table("documents").delete().eq("id", document_id).eq("tenant_id", tenant_id).execute()
+        if not delete_result.data:
+            return jsonify({"error": "Document not found or already deleted"}), 404
+
+        return jsonify({
+            "message": "Document deleted successfully",
+            "document_id": document_id,
+            "filename": doc.get("filename"),
+        }), 200
+
+    # --- Fall back to csv_registry (CSV) ---
+    csv_result = supabase.table("csv_registry").select("id, filename, storage_path").eq("id", document_id).eq("tenant_id", tenant_id).execute()
+    if not csv_result.data:
+        return jsonify({"error": "Document not found"}), 404
+
+    csv_file = csv_result.data[0]
+    storage_path = csv_file.get("storage_path")
+
+    if storage_path:
+        try:
+            supabase.storage.from_("elorag-docs").remove([storage_path])
+        except Exception as e:
+            current_app.logger.warning(f"Failed to delete file from storage: {storage_path}, error: {str(e)}")
+
+    delete_result = supabase.table("csv_registry").delete().eq("id", document_id).eq("tenant_id", tenant_id).execute()
+    if not delete_result.data:
+        return jsonify({"error": "CSV file not found or already deleted"}), 404
+
+    return jsonify({
+        "message": "CSV file deleted successfully",
+        "document_id": document_id,
+        "filename": csv_file.get("filename"),
     }), 200
 
 
@@ -526,9 +718,10 @@ def list_csv_registry(**kwargs):
     if not supabase:
         return jsonify({"error": "Database not configured"}), 500
 
-    cols = "id, tenant_id, filename, columns, summary, status, uploaded_by, row_count, chunk_count, created_at, updated_at"
+    cols = "id, tenant_id, filename, columns, summary, status, uploaded_by, row_count, chunk_count, rejection_reason, created_at, updated_at"
     q = supabase.table("csv_registry").select(cols).eq("tenant_id", tenant_id).order("created_at", desc=True)
-    if status and status in ("draft", "review", "approved"):
+    valid_statuses = ("draft", "review", "approved", "rejected", "pending_processing", "processing_failed")
+    if status and status in valid_statuses:
         q = q.eq("status", status)
     result = q.execute()
     items = result.data or []
@@ -630,11 +823,13 @@ def bulk_approve_csv(**kwargs):
 @require_role("admin", "reviewer")
 def bulk_reject_csv(**kwargs):
     """
-    Bulk reject CSV files. Rejects CSV files by deleting them.
+    Bulk reject CSV files. Marks CSV files as 'rejected' and stores the rejection reason.
+    Admin, reviewer, and editor can retrieve rejected CSV files and see the reason.
     
     Request body:
     {
-        "file_ids": ["uuid1", "uuid2", ...]  # Required: list of CSV file IDs to reject
+        "file_ids": ["uuid1", "uuid2", ...],  # Required: list of CSV file IDs to reject
+        "reason": "Optional rejection reason"  # Optional: reason visible to all staff roles
     }
     
     Returns:
@@ -650,42 +845,99 @@ def bulk_reject_csv(**kwargs):
     
     body = request.get_json(silent=True) or {}
     file_ids = body.get("file_ids") or []
-    
+    reason = (body.get("reason") or "").strip()
+
     if not file_ids:
         return jsonify({"error": "file_ids is required"}), 400
     
     now = datetime.now(timezone.utc).isoformat()
-    
-    # Get CSV files before deletion for audit
-    files_to_delete = (
+
+    # Mark CSV files as rejected (keeping record + chunks intact for visibility)
+    update_payload = {
+        "status": "rejected",
+        "rejection_reason": reason or None,
+        "updated_at": now,
+    }
+    result = (
         supabase.table("csv_registry")
-        .select("id, filename")
+        .update(update_payload)
         .eq("tenant_id", tenant_id)
         .in_("id", file_ids)
         .execute()
     )
-    
-    rejected_ids = [f["id"] for f in files_to_delete.data] if files_to_delete.data else []
-    
-    # Delete CSV files (cascade will delete chunks automatically)
-    if rejected_ids:
-        delete_result = (
-            supabase.table("csv_registry")
-            .delete()
-            .eq("tenant_id", tenant_id)
-            .in_("id", rejected_ids)
-            .execute()
-        )
-    
+
+    rejected_ids = [f["id"] for f in result.data] if result.data else []
     rejected_count = len(rejected_ids)
-    
-    return jsonify({
+
+    response = {
         "message": f"Rejected {rejected_count} CSV file(s)",
         "rejected_count": rejected_count,
         "rejected_file_ids": rejected_ids,
         "action": "bulk_reject",
         "actor": user_id,
         "timestamp": now,
+    }
+    if reason:
+        response["reason"] = reason
+
+    return jsonify(response), 200
+
+
+@document_upload_bp.route("/csv-registry/<file_id>", methods=["PATCH"])
+@require_role("admin", "editor")
+def update_csv_file(file_id: str, **kwargs):
+    """
+    Update CSV file metadata (filename, summary, etc.).
+    Only editable fields: filename, summary.
+    Status changes should use /csv-registry/<file_id>/status endpoint.
+    
+    Request body:
+    {
+        "filename": "new_filename.csv",  # Optional: new filename
+        "summary": "Updated summary"     # Optional: new summary
+    }
+    """
+    tenant_id = kwargs["tenant_id"]
+    body = request.get_json(silent=True) or {}
+    
+    supabase = current_app.supabase_client
+    if not supabase:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    # Check if CSV file exists
+    csv_result = supabase.table("csv_registry").select("id, filename").eq("id", file_id).eq("tenant_id", tenant_id).execute()
+    if not csv_result.data:
+        return jsonify({"error": "CSV file not found"}), 404
+    
+    # Build update payload
+    update_payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    # Update filename if provided
+    if "filename" in body:
+        new_filename = (body.get("filename") or "").strip()
+        if not new_filename:
+            return jsonify({"error": "filename cannot be empty"}), 400
+        update_payload["filename"] = new_filename
+    
+    # Update summary if provided
+    if "summary" in body:
+        summary = (body.get("summary") or "").strip()
+        update_payload["summary"] = summary if summary else None
+    
+    if len(update_payload) == 1:  # Only updated_at, nothing to update
+        return jsonify({"error": "No fields provided to update"}), 400
+    
+    # Update CSV file
+    result = supabase.table("csv_registry").update(update_payload).eq("id", file_id).eq("tenant_id", tenant_id).execute()
+    if not result.data:
+        return jsonify({"error": "CSV file not found"}), 404
+    
+    return jsonify({
+        "message": "CSV file updated successfully",
+        "file_id": file_id,
+        "updated_fields": {k: v for k, v in update_payload.items() if k != "updated_at"}
     }), 200
 
 
@@ -709,32 +961,3 @@ def update_csv_status(file_id: str, **kwargs):
         return jsonify({"error": "CSV file not found"}), 404
     return jsonify({"file_id": file_id, "status": status}), 200
 
-
-@document_upload_bp.route("/csv-registry/publish-to-pinecone", methods=["POST"])
-@require_role("admin", "editor")
-def publish_csv_to_pinecone(**kwargs):
-    """
-    Embed approved CSV chunks and upsert to tenant Pinecone index.
-    Metadata includes file_id and source_type='csv' to bridge with Supabase csv_registry.
-    Optional body: { "file_ids": ["uuid1", ...] } — if empty, publish all approved CSV files.
-    
-    Returns task_id for background processing.
-    """
-    tenant_id = kwargs["tenant_id"]
-    
-    body = request.get_json(silent=True) or {}
-    file_ids = body.get("file_ids") or []
-
-    # Enqueue background task (only CSV files, no documents)
-    from tasks.document_tasks import publish_to_pinecone_task
-    task = publish_to_pinecone_task.delay(
-        tenant_id=tenant_id,
-        document_ids=None,  # Only CSV files
-        file_ids=file_ids if file_ids else None,
-    )
-    
-    return jsonify({
-        "message": "CSV publish to Pinecone queued for processing",
-        "task_id": task.id,
-        "status": "processing",
-    }), 202

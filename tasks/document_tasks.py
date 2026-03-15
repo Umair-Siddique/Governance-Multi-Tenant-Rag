@@ -116,7 +116,7 @@ def _process_pending_documents_impl(self):
 
 def init_celery_from_app(app):
     """Initialize Celery from Flask app (called after app creation)."""
-    global celery, process_document_upload, process_csv_upload, publish_to_pinecone_task, process_document_from_storage, process_pending_documents
+    global celery, process_document_upload, process_csv_upload, publish_to_pinecone_task, process_document_from_storage, process_pending_documents, process_document_batch
     celery = make_celery(app)
     
     # Register tasks after celery is initialized
@@ -124,6 +124,7 @@ def init_celery_from_app(app):
     process_csv_upload = celery.task(bind=True)(_process_csv_upload_impl)
     publish_to_pinecone_task = celery.task(bind=True)(_publish_to_pinecone_impl)
     process_document_from_storage = celery.task(bind=True)(_process_document_from_storage_impl)
+    process_document_batch = celery.task(bind=True)(_process_document_batch_impl)
     
     # Periodic task to process pending documents (runs every 30 seconds)
     process_pending_documents = celery.task(bind=True, name='tasks.document_tasks.process_pending_documents')(_process_pending_documents_impl)
@@ -663,12 +664,59 @@ def _process_csv_from_storage(supabase, tenant_id: str, file_id: str, storage_pa
     }
 
 
+def _process_document_batch_impl(self, tenant_id: str, batch_items: list):
+    """
+    Process a batch of documents (PDF/DOCX/CSV) from storage as a single background task.
+    Provides one task_id for the entire upload batch instead of one per document.
+
+    Args:
+        tenant_id: Tenant ID
+        batch_items: List of dicts, each with keys:
+            - document_id (str)
+            - storage_path (str)
+            - filename (str)
+            - file_type (str)  e.g. "pdf", "docx", "csv"
+
+    Returns:
+        dict with total, processed, failed counts and per-item results/errors.
+    """
+    results = []
+    errors = []
+
+    for item in batch_items:
+        try:
+            result = _process_document_from_storage_impl(
+                self,
+                tenant_id=tenant_id,
+                document_id=item["document_id"],
+                storage_path=item["storage_path"],
+                filename=item["filename"],
+                file_type=item["file_type"],
+            )
+            results.append(result)
+        except Exception as e:
+            errors.append({
+                "document_id": item["document_id"],
+                "filename": item["filename"],
+                "error": str(e),
+            })
+
+    return {
+        "total": len(batch_items),
+        "processed": len(results),
+        "failed": len(errors),
+        "results": results,
+        "errors": errors,
+    }
+
+
 # Tasks will be registered after celery is initialized
 process_document_upload = None
 process_csv_upload = None
 publish_to_pinecone_task = None
 process_document_from_storage = None
 process_pending_documents = None
+process_document_batch = None
 
 
 

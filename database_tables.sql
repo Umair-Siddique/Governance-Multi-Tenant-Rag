@@ -120,11 +120,12 @@ CREATE TABLE IF NOT EXISTS documents (
     filename VARCHAR(500) NOT NULL,
     file_type VARCHAR(50) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'draft'
-        CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed')),
+        CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed', 'rejected')),
     uploaded_by UUID NOT NULL,
     raw_text TEXT,
     chunk_count INTEGER DEFAULT 0,
     storage_path VARCHAR(1000),
+    rejection_reason TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
@@ -133,6 +134,14 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS documents_tenant_status_idx ON documents (tenant_id, status);
 CREATE INDEX IF NOT EXISTS documents_pending_processing_idx ON documents (tenant_id, status) 
     WHERE status = 'pending_processing';
+CREATE INDEX IF NOT EXISTS documents_rejected_idx ON documents (tenant_id, status)
+    WHERE status = 'rejected';
+
+-- Safe migration for existing environments
+ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_status_check;
+ALTER TABLE documents ADD CONSTRAINT documents_status_check
+    CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed', 'rejected'));
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
 
 -- Enable RLS
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
@@ -195,11 +204,12 @@ CREATE TABLE IF NOT EXISTS csv_registry (
     columns JSONB NOT NULL DEFAULT '[]'::jsonb,
     summary TEXT,
     status VARCHAR(20) NOT NULL DEFAULT 'draft'
-        CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed')),
+        CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed', 'rejected')),
     uploaded_by UUID NOT NULL,
     row_count INTEGER DEFAULT 0,
     chunk_count INTEGER DEFAULT 0,
     storage_path VARCHAR(1000),
+    rejection_reason TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
@@ -208,6 +218,14 @@ CREATE TABLE IF NOT EXISTS csv_registry (
 CREATE INDEX IF NOT EXISTS csv_registry_tenant_status_idx ON csv_registry (tenant_id, status);
 CREATE INDEX IF NOT EXISTS csv_registry_pending_processing_idx ON csv_registry (tenant_id, status) 
     WHERE status = 'pending_processing';
+CREATE INDEX IF NOT EXISTS csv_registry_rejected_idx ON csv_registry (tenant_id, status)
+    WHERE status = 'rejected';
+
+-- Safe migration for existing environments
+ALTER TABLE csv_registry DROP CONSTRAINT IF EXISTS csv_registry_status_check;
+ALTER TABLE csv_registry ADD CONSTRAINT csv_registry_status_check
+    CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed', 'rejected'));
+ALTER TABLE csv_registry ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
 
 ALTER TABLE csv_registry ENABLE ROW LEVEL SECURITY;
 
