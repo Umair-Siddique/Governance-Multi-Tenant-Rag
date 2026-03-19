@@ -1,6 +1,7 @@
 """
 Document upload API.
 Upload documents → extract text → preprocess → recursive chunk → store in Supabase.
+Supports PDF, DOCX, CSV, and images (JPG, PNG, etc.; images use Tesseract OCR).
 CSV: Supabase as Metadata Catalog (csv_registry + csv_chunks), Pinecone as Search Index with metadata bridge.
 Editor/Admin can upload; reviewers view chunks before approval.
 
@@ -22,6 +23,10 @@ from utils.document_utils import (
 
 
 document_upload_bp = Blueprint("document_upload", __name__)
+
+# In-memory task hints so queued tasks can expose progress before worker starts.
+# Format: {task_id: {task_type, stage, message, total, processed, failed, ...}}
+TASK_STATUS_HINTS = {}
 
 
 def sanitize_filename(filename: str) -> str:
@@ -75,10 +80,33 @@ def get_task_status(task_id: str, **kwargs):
         }), 500
     
     task = celery_app.AsyncResult(task_id)
+    queued_hint = TASK_STATUS_HINTS.get(task_id) or {}
     
     # Get task state and info
     task_state = task.state
     task_ready = task.ready()
+    task_info = task.info if isinstance(task.info, dict) else {}
+    progress = {
+        "task_type": task_info.get("task_type"),
+        "stage": task_info.get("stage"),
+        "message": task_info.get("message"),
+        "total": task_info.get("total"),
+        "processed": task_info.get("processed"),
+        "failed": task_info.get("failed"),
+        "progress_percent": task_info.get("progress_percent"),
+        "documents_matched": task_info.get("documents_matched"),
+        "csv_files_matched": task_info.get("csv_files_matched"),
+        "chunks_prepared": task_info.get("chunks_prepared"),
+        "document_chunks": task_info.get("document_chunks"),
+        "csv_chunks": task_info.get("csv_chunks"),
+        "current_document_id": task_info.get("current_document_id"),
+        "current_filename": task_info.get("current_filename"),
+        "current_file_type": task_info.get("current_file_type"),
+    }
+    # Remove empty keys to keep response compact
+    progress = {k: v for k, v in progress.items() if v is not None}
+    if not progress and queued_hint:
+        progress = dict(queued_hint)
     
     if task_state == 'PENDING':
         # Check if task is actually pending or if result backend lost it
@@ -102,14 +130,18 @@ def get_task_status(task_id: str, **kwargs):
             response = {
                 'task_id': task_id,
                 'status': 'PENDING',
-                'message': 'Task is waiting to be processed',
+                'message': progress.get("message") if progress else 'Task is waiting to be processed',
             }
-    elif task_state == 'STARTED':
+            if progress:
+                response['progress'] = progress
+    elif task_state in ('STARTED', 'PROGRESS'):
         response = {
             'task_id': task_id,
             'status': 'PROCESSING',
-            'message': 'Task is being processed',
+            'message': task_info.get("message") or 'Task is being processed',
         }
+        if progress:
+            response['progress'] = progress
     elif task_state == 'SUCCESS':
         try:
             result = task.result
@@ -118,6 +150,26 @@ def get_task_status(task_id: str, **kwargs):
                 'status': 'SUCCESS',
                 'result': result,
             }
+            if isinstance(result, dict):
+                if {"total", "processed", "failed"}.issubset(result.keys()):
+                    response['progress'] = {
+                        "task_type": "document_batch",
+                        "stage": "completed",
+                        "total": result.get("total"),
+                        "processed": result.get("processed"),
+                        "failed": result.get("failed"),
+                        "progress_percent": 100,
+                    }
+                elif any(k in result for k in ("documents_published", "csv_files_published", "chunks_upserted")):
+                    response['progress'] = {
+                        "task_type": "publish_to_pinecone",
+                        "stage": "completed",
+                        "documents_published": result.get("documents_published", 0),
+                        "csv_files_published": result.get("csv_files_published", 0),
+                        "chunks_upserted": result.get("chunks_upserted", 0),
+                        "progress_percent": 100,
+                    }
+            TASK_STATUS_HINTS.pop(task_id, None)
         except Exception as e:
             response = {
                 'task_id': task_id,
@@ -133,6 +185,9 @@ def get_task_status(task_id: str, **kwargs):
                 'status': 'FAILURE',
                 'error': str(error_info) if error_info else 'Task failed',
             }
+            if progress:
+                response['progress'] = progress
+            TASK_STATUS_HINTS.pop(task_id, None)
         except Exception as e:
             response = {
                 'task_id': task_id,
@@ -164,8 +219,8 @@ def get_task_status(task_id: str, **kwargs):
 @require_role("admin", "editor")
 def upload_document(**kwargs):
     """
-    Upload one or more documents (PDF, DOCX, CSV), store in Supabase Storage, and queue for processing.
-    Supports bulk uploads - accepts multiple files in a single request.
+    Upload one or more documents (PDF, DOCX, CSV, or images), store in Supabase Storage, and queue for processing.
+    Images are processed with Tesseract OCR. Supports bulk uploads - accepts multiple files in a single request.
 
     Expects multipart/form-data with file field "file" (can be multiple files).
 
@@ -205,7 +260,7 @@ def upload_document(**kwargs):
             if not is_supported(filename):
                 errors.append({
                     "filename": filename,
-                    "error": f"Unsupported file type: {ext}. Supported: .pdf, .docx, .csv"
+                    "error": f"Unsupported file type: {ext}. Supported: .pdf, .docx, .csv, and images (.jpg, .png, etc.)"
                 })
                 continue
 
@@ -310,6 +365,15 @@ def upload_document(**kwargs):
             batch_items=batch_items,
         )
         batch_task_id = batch_task.id
+        TASK_STATUS_HINTS[batch_task_id] = {
+            "task_type": "document_batch",
+            "stage": "queued",
+            "message": "Task queued for processing",
+            "total": len(batch_items),
+            "processed": 0,
+            "failed": 0,
+            "progress_percent": 0,
+        }
 
     # Return response with all uploaded documents and any errors
     response = {
@@ -330,8 +394,6 @@ def upload_document(**kwargs):
         return jsonify(response), 207  # Multi-Status
     else:
         return jsonify(response), 202
-
-
 
 
 @document_upload_bp.route("/documents", methods=["GET"])
@@ -672,6 +734,121 @@ def update_document_status(document_id: str, **kwargs):
     return jsonify({"document_id": document_id, "status": status}), 200
 
 
+@document_upload_bp.route("/documents/bulk-submit-review", methods=["POST"])
+@require_role("admin", "editor")
+def bulk_submit_documents_for_review(**kwargs):
+    """
+    Submit multiple draft items to review in one request.
+    Supports mixed IDs across documents and csv_registry.
+
+    Request body:
+    {
+        "document_ids": ["uuid1", "uuid2", ...]  # Required
+    }
+    """
+    tenant_id = kwargs["tenant_id"]
+    current_user = kwargs["current_user"]
+    user_id = current_user["id"]
+
+    supabase = current_app.supabase_client
+    if not supabase:
+        return jsonify({"error": "Database not configured"}), 500
+
+    body = request.get_json(silent=True) or {}
+    document_ids = body.get("document_ids") or []
+
+    if not isinstance(document_ids, list):
+        return jsonify({"error": "document_ids must be a list"}), 400
+
+    # Remove blanks while preserving order and uniqueness
+    cleaned_ids = []
+    seen = set()
+    for item in document_ids:
+        item_str = str(item).strip() if item is not None else ""
+        if not item_str or item_str in seen:
+            continue
+        seen.add(item_str)
+        cleaned_ids.append(item_str)
+
+    if not cleaned_ids:
+        return jsonify({"error": "document_ids is required"}), 400
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Resolve IDs from documents first, then csv_registry (same pattern as bulk approve/reject)
+    doc_rows = (
+        supabase.table("documents")
+        .select("id, status")
+        .eq("tenant_id", tenant_id)
+        .in_("id", cleaned_ids)
+        .execute()
+    ).data or []
+    doc_status_by_id = {r["id"]: (r.get("status") or "").strip().lower() for r in doc_rows}
+    doc_ids = set(doc_status_by_id.keys())
+
+    csv_candidate_ids = [i for i in cleaned_ids if i not in doc_ids]
+    csv_status_by_id = {}
+    if csv_candidate_ids:
+        csv_rows = (
+            supabase.table("csv_registry")
+            .select("id, status")
+            .eq("tenant_id", tenant_id)
+            .in_("id", csv_candidate_ids)
+            .execute()
+        ).data or []
+        csv_status_by_id = {r["id"]: (r.get("status") or "").strip().lower() for r in csv_rows}
+
+    csv_ids = set(csv_status_by_id.keys())
+    found_ids = doc_ids | csv_ids
+    not_found_ids = [i for i in cleaned_ids if i not in found_ids]
+
+    # Only draft items are eligible
+    draft_doc_ids = [i for i, s in doc_status_by_id.items() if s == "draft"]
+    draft_csv_ids = [i for i, s in csv_status_by_id.items() if s == "draft"]
+    non_draft_ids = [i for i, s in doc_status_by_id.items() if s != "draft"] + [i for i, s in csv_status_by_id.items() if s != "draft"]
+
+    moved_doc_ids = []
+    moved_csv_ids = []
+    if draft_doc_ids:
+        moved_docs = (
+            supabase.table("documents")
+            .update({"status": "review", "updated_at": now})
+            .eq("tenant_id", tenant_id)
+            .in_("id", draft_doc_ids)
+            .eq("status", "draft")
+            .execute()
+        ).data or []
+        moved_doc_ids = [r["id"] for r in moved_docs]
+
+    if draft_csv_ids:
+        moved_csv = (
+            supabase.table("csv_registry")
+            .update({"status": "review", "updated_at": now})
+            .eq("tenant_id", tenant_id)
+            .in_("id", draft_csv_ids)
+            .eq("status", "draft")
+            .execute()
+        ).data or []
+        moved_csv_ids = [r["id"] for r in moved_csv]
+
+    moved_ids = moved_doc_ids + moved_csv_ids
+
+    response = {
+        "message": f"Submitted {len(moved_ids)} item(s) for review",
+        "submitted_count": len(moved_ids),
+        "submitted_document_ids": moved_ids,
+        "action": "bulk_submit_review",
+        "actor": user_id,
+        "timestamp": now,
+    }
+    if non_draft_ids:
+        response["skipped_non_draft_ids"] = non_draft_ids
+    if not_found_ids:
+        response["not_found_ids"] = not_found_ids
+
+    return jsonify(response), 200
+
+
 @document_upload_bp.route("/documents/publish-to-pinecone", methods=["POST"])
 @require_role("admin", "editor")
 def publish_to_pinecone(**kwargs):
@@ -697,6 +874,14 @@ def publish_to_pinecone(**kwargs):
         document_ids=document_ids if document_ids else None,
         file_ids=file_ids if file_ids else None,
     )
+    TASK_STATUS_HINTS[task.id] = {
+        "task_type": "publish_to_pinecone",
+        "stage": "queued",
+        "message": "Publish task queued",
+        "requested_document_ids": len(document_ids),
+        "requested_file_ids": len(file_ids),
+        "progress_percent": 0,
+    }
     
     return jsonify({
         "message": "Publish to Pinecone queued for processing",
@@ -710,7 +895,7 @@ def publish_to_pinecone(**kwargs):
 @document_upload_bp.route("/csv-registry", methods=["GET"])
 @require_role("admin", "editor", "reviewer")
 def list_csv_registry(**kwargs):
-    """List CSV files for the tenant. Optional query: ?status=draft|review|approved"""
+    """List CSV files for the tenant. Optional query includes draft/review/approved/pending_*."""
     tenant_id = kwargs["tenant_id"]
     status = request.args.get("status", "").strip().lower()
 

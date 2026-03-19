@@ -1,6 +1,6 @@
 """
 Celery tasks for document processing and embedding.
-Handles PDF/DOCX extraction, CSV processing, and Pinecone publishing in background.
+Handles PDF/DOCX/image extraction (images via Tesseract OCR), CSV processing, and Pinecone publishing in background.
 """
 import io
 import uuid
@@ -37,6 +37,7 @@ def make_celery(app):
         result_serializer='json',
         timezone='UTC',
         enable_utc=True,
+        task_track_started=True,
     )
     
     class ContextTask(celery.Task):
@@ -165,6 +166,17 @@ def _embed_batch(openai_client, texts: list, batch_size: int = 100):
         )
         out.extend([e.embedding for e in resp.data])
     return out
+
+
+def _update_task_progress(task_self, **meta):
+    """Best-effort task progress update for live status polling."""
+    if not hasattr(task_self, "update_state"):
+        return
+    try:
+        task_self.update_state(state="PROGRESS", meta=meta)
+    except Exception:
+        # Progress reporting should never break business flow
+        pass
 
 
 def _process_document_upload_impl(self, tenant_id: str, user_id: str, filename: str, file_data: bytes, file_ext: str):
@@ -347,6 +359,15 @@ def _publish_to_pinecone_impl(self, tenant_id: str, document_ids: list = None, f
         supabase = _get_supabase_client()
         pinecone_service = _get_pinecone_service()
         openai_client = _get_openai_client()
+        _update_task_progress(
+            self,
+            task_type="publish_to_pinecone",
+            stage="starting",
+            message="Starting publish pipeline",
+            documents_matched=0,
+            csv_files_matched=0,
+            chunks_prepared=0,
+        )
         
         all_vectors = []
         docs_published = 0
@@ -372,6 +393,15 @@ def _publish_to_pinecone_impl(self, tenant_id: str, document_ids: list = None, f
             )
         
         docs = doc_result.data or []
+        _update_task_progress(
+            self,
+            task_type="publish_to_pinecone",
+            stage="documents_selected",
+            message="Selected approved documents",
+            documents_matched=len(docs),
+            csv_files_matched=0,
+            chunks_prepared=len(all_vectors),
+        )
         if docs:
             doc_ids = [d["id"] for d in docs]
             doc_filenames = {d["id"]: d["filename"] for d in docs}
@@ -386,6 +416,16 @@ def _publish_to_pinecone_impl(self, tenant_id: str, document_ids: list = None, f
             )
             doc_chunks = chunks_result.data or []
             if doc_chunks:
+                _update_task_progress(
+                    self,
+                    task_type="publish_to_pinecone",
+                    stage="embedding_documents",
+                    message="Embedding document chunks",
+                    documents_matched=len(docs),
+                    csv_files_matched=0,
+                    chunks_prepared=len(all_vectors),
+                    document_chunks=len(doc_chunks),
+                )
                 texts = [c["content"] for c in doc_chunks]
                 embeddings = _embed_batch(openai_client, texts)
                 for chunk, embedding in zip(doc_chunks, embeddings):
@@ -406,6 +446,16 @@ def _publish_to_pinecone_impl(self, tenant_id: str, document_ids: list = None, f
                         },
                     })
                 docs_published = len(docs)
+                _update_task_progress(
+                    self,
+                    task_type="publish_to_pinecone",
+                    stage="documents_embedded",
+                    message="Document chunks embedded",
+                    documents_matched=len(docs),
+                    csv_files_matched=0,
+                    chunks_prepared=len(all_vectors),
+                    document_chunks=len(doc_chunks),
+                )
         
         # Process CSV files
         if file_ids:
@@ -427,6 +477,15 @@ def _publish_to_pinecone_impl(self, tenant_id: str, document_ids: list = None, f
             )
         
         csv_files = reg_result.data or []
+        _update_task_progress(
+            self,
+            task_type="publish_to_pinecone",
+            stage="csv_selected",
+            message="Selected approved CSV files",
+            documents_matched=len(docs),
+            csv_files_matched=len(csv_files),
+            chunks_prepared=len(all_vectors),
+        )
         if csv_files:
             csv_id_list = [f["id"] for f in csv_files]
             filenames = {f["id"]: f["filename"] for f in csv_files}
@@ -441,6 +500,16 @@ def _publish_to_pinecone_impl(self, tenant_id: str, document_ids: list = None, f
             )
             csv_chunks = chunks_result.data or []
             if csv_chunks:
+                _update_task_progress(
+                    self,
+                    task_type="publish_to_pinecone",
+                    stage="embedding_csv",
+                    message="Embedding CSV chunks",
+                    documents_matched=len(docs),
+                    csv_files_matched=len(csv_files),
+                    chunks_prepared=len(all_vectors),
+                    csv_chunks=len(csv_chunks),
+                )
                 texts = [c["content"] for c in csv_chunks]
                 embeddings = _embed_batch(openai_client, texts)
                 for chunk, embedding in zip(csv_chunks, embeddings):
@@ -461,6 +530,16 @@ def _publish_to_pinecone_impl(self, tenant_id: str, document_ids: list = None, f
                         },
                     })
                 csv_files_published = len(csv_files)
+                _update_task_progress(
+                    self,
+                    task_type="publish_to_pinecone",
+                    stage="csv_embedded",
+                    message="CSV chunks embedded",
+                    documents_matched=len(docs),
+                    csv_files_matched=len(csv_files),
+                    chunks_prepared=len(all_vectors),
+                    csv_chunks=len(csv_chunks),
+                )
         
         if not all_vectors:
             return {
@@ -471,6 +550,15 @@ def _publish_to_pinecone_impl(self, tenant_id: str, document_ids: list = None, f
             }
         
         # Upsert to Pinecone
+        _update_task_progress(
+            self,
+            task_type="publish_to_pinecone",
+            stage="upserting_vectors",
+            message="Upserting vectors to Pinecone",
+            documents_matched=len(docs),
+            csv_files_matched=len(csv_files),
+            chunks_prepared=len(all_vectors),
+        )
         pinecone_service.upsert_vectors(tenant_id, all_vectors)
         
         return {
@@ -495,7 +583,7 @@ def _process_document_from_storage_impl(self, tenant_id: str, document_id: str, 
         document_id: Document ID in database
         storage_path: Path to file in Supabase Storage
         filename: Original filename
-        file_type: File type (pdf, docx, csv)
+        file_type: File type (pdf, docx, csv, or image e.g. jpg, png)
     
     Returns:
         dict with document_id, filename, status, chunk_count
@@ -666,7 +754,7 @@ def _process_csv_from_storage(supabase, tenant_id: str, file_id: str, storage_pa
 
 def _process_document_batch_impl(self, tenant_id: str, batch_items: list):
     """
-    Process a batch of documents (PDF/DOCX/CSV) from storage as a single background task.
+    Process a batch of documents (PDF/DOCX/CSV/images) from storage as a single background task.
     Provides one task_id for the entire upload batch instead of one per document.
 
     Args:
@@ -675,15 +763,38 @@ def _process_document_batch_impl(self, tenant_id: str, batch_items: list):
             - document_id (str)
             - storage_path (str)
             - filename (str)
-            - file_type (str)  e.g. "pdf", "docx", "csv"
+            - file_type (str)  e.g. "pdf", "docx", "csv", "jpg", "png"
 
     Returns:
         dict with total, processed, failed counts and per-item results/errors.
     """
     results = []
     errors = []
+    total = len(batch_items)
+
+    _update_task_progress(
+        self,
+        task_type="document_batch",
+        stage="starting",
+        message="Batch processing started",
+        total=total,
+        processed=0,
+        failed=0,
+    )
 
     for item in batch_items:
+        _update_task_progress(
+            self,
+            task_type="document_batch",
+            stage="processing_item",
+            message=f"Processing {item.get('filename', 'document')}",
+            total=total,
+            processed=len(results),
+            failed=len(errors),
+            current_document_id=item.get("document_id"),
+            current_filename=item.get("filename"),
+            current_file_type=item.get("file_type"),
+        )
         try:
             result = _process_document_from_storage_impl(
                 self,
@@ -700,9 +811,19 @@ def _process_document_batch_impl(self, tenant_id: str, batch_items: list):
                 "filename": item["filename"],
                 "error": str(e),
             })
+        _update_task_progress(
+            self,
+            task_type="document_batch",
+            stage="processing_item",
+            message="Batch processing in progress",
+            total=total,
+            processed=len(results),
+            failed=len(errors),
+            progress_percent=int(((len(results) + len(errors)) / total) * 100) if total else 100,
+        )
 
     return {
-        "total": len(batch_items),
+        "total": total,
         "processed": len(results),
         "failed": len(errors),
         "results": results,

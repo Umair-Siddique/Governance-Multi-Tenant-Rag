@@ -29,6 +29,8 @@ except ImportError:
 SUPPORTED_PDF_EXTENSIONS = {".pdf"}
 SUPPORTED_DOCX_EXTENSIONS = {".docx"}
 SUPPORTED_CSV_EXTENSIONS = {".csv"}
+# Image formats processed via Tesseract OCR (PIL-openable)
+SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
 
 
 # --- Unicode categories to strip (control, format, surrogate, private-use) ---
@@ -52,6 +54,38 @@ def _ocr_image(image_input: Union["Image.Image", bytes], tesseract_cmd: Optional
             img = img.convert("RGB")
         text = pytesseract.image_to_string(img)
         return (text or "").strip()
+    except Exception:
+        return ""
+
+
+def extract_text_from_image(
+    source: Union[str, Path, bytes, BinaryIO],
+    tesseract_cmd: Optional[str] = None,
+) -> str:
+    """
+    Extract text from an image file using Tesseract OCR.
+    Same cleaning/normalization as other formats is applied later via preprocess_text.
+
+    Args:
+        source: File path, bytes, or file-like object.
+        tesseract_cmd: Optional path to tesseract executable.
+
+    Returns:
+        Extracted text as a single string.
+    """
+    if not _OCR_AVAILABLE or not Image:
+        return ""
+    try:
+        if isinstance(source, (str, Path)):
+            img = Image.open(str(source))
+        elif isinstance(source, bytes):
+            img = Image.open(io.BytesIO(source))
+        elif hasattr(source, "read"):
+            source.seek(0)
+            img = Image.open(io.BytesIO(source.read()))
+        else:
+            raise TypeError("source must be path, bytes, or file-like object")
+        return _ocr_image(img, tesseract_cmd)
     except Exception:
         return ""
 
@@ -407,8 +441,12 @@ def extract_and_preprocess(
         raw = extract_text_from_pdf(source, password=password, tesseract_cmd=tesseract_cmd)
     elif file_ext in SUPPORTED_DOCX_EXTENSIONS:
         raw = extract_text_from_docx(source, tesseract_cmd=tesseract_cmd)
+    elif file_ext in SUPPORTED_IMAGE_EXTENSIONS:
+        raw = extract_text_from_image(source, tesseract_cmd=tesseract_cmd)
     else:
-        raise ValueError(f"Unsupported file type: {file_ext}. Supported: PDF, DOCX")
+        raise ValueError(
+            f"Unsupported file type: {file_ext}. Supported: PDF, DOCX, CSV, and images (e.g. JPG, PNG)"
+        )
 
     if preprocess:
         return preprocess_text(raw, **preprocess_kwargs)
@@ -416,8 +454,13 @@ def extract_and_preprocess(
 
 
 def get_supported_extensions() -> set:
-    """Return all supported file extensions for extraction (PDF, DOCX, CSV)."""
-    return SUPPORTED_PDF_EXTENSIONS | SUPPORTED_DOCX_EXTENSIONS | SUPPORTED_CSV_EXTENSIONS
+    """Return all supported file extensions for extraction (PDF, DOCX, CSV, images)."""
+    return (
+        SUPPORTED_PDF_EXTENSIONS
+        | SUPPORTED_DOCX_EXTENSIONS
+        | SUPPORTED_CSV_EXTENSIONS
+        | SUPPORTED_IMAGE_EXTENSIONS
+    )
 
 
 def is_supported(filename_or_ext: str) -> bool:
