@@ -119,6 +119,8 @@ def init_celery_from_app(app):
     """Initialize Celery from Flask app (called after app creation)."""
     global celery, process_document_upload, process_csv_upload, publish_to_pinecone_task, process_document_from_storage, process_pending_documents, process_document_batch
     celery = make_celery(app)
+    # Keep a single authoritative Celery instance on the Flask app.
+    app.celery = celery
     
     # Register tasks after celery is initialized
     process_document_upload = celery.task(bind=True)(_process_document_upload_impl)
@@ -129,12 +131,12 @@ def init_celery_from_app(app):
     
     # Periodic task to process pending documents (runs every 30 seconds)
     process_pending_documents = celery.task(bind=True, name='tasks.document_tasks.process_pending_documents')(_process_pending_documents_impl)
-    celery.conf.beat_schedule = {
-        'process-pending-documents': {
-            'task': 'tasks.document_tasks.process_pending_documents',
-            'schedule': 30.0,  # Run every 30 seconds
-        },
+    existing_schedule = dict(getattr(celery.conf, "beat_schedule", {}) or {})
+    existing_schedule['process-pending-documents'] = {
+        'task': 'tasks.document_tasks.process_pending_documents',
+        'schedule': 30.0,  # Run every 30 seconds
     }
+    celery.conf.beat_schedule = existing_schedule
     
     return celery
 

@@ -1,7 +1,7 @@
 from flask import Flask
 from config import Config
 
-from extensions import init_openai_service, init_supabase, init_email_service, init_token_service, init_encryption_service, init_pinecone_service, init_openai_service, init_celery
+from extensions import init_openai_service, init_supabase, init_email_service, init_token_service, init_encryption_service, init_pinecone_service
 
 from blueprints.auth import auth_bp
 from blueprints.llm_providers import llm_providers_bp
@@ -30,7 +30,6 @@ def create_app():
     init_encryption_service(app)
     init_pinecone_service(app)
     init_openai_service(app)
-    init_celery(app)
     
     # Initialize Celery tasks with app context
     from tasks.document_tasks import init_celery_from_app

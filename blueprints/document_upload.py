@@ -850,7 +850,7 @@ def bulk_submit_documents_for_review(**kwargs):
 
 
 @document_upload_bp.route("/documents/publish-to-pinecone", methods=["POST"])
-@require_role("admin", "editor")
+@require_role("admin", "reviewer")
 def publish_to_pinecone(**kwargs):
     """
     Publish approved content to Pinecone: both documents (PDF/DOCX) and CSV files.
