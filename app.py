@@ -8,6 +8,7 @@ from blueprints.llm_providers import llm_providers_bp
 from blueprints.tenants import tenants_bp
 from blueprints.invitations import invitations_bp, invite_accept_bp
 from blueprints.document_upload import document_upload_bp
+from blueprints.retriever import retriever_bp
 
 from flask_cors import CORS
 
@@ -44,6 +45,6 @@ def create_app():
     # Invite acceptance under /auth  (public, no login required)
     app.register_blueprint(invite_accept_bp, url_prefix="/auth")
     app.register_blueprint(document_upload_bp, url_prefix="/api")
-
+    app.register_blueprint(retriever_bp, url_prefix="/api")
 
     return app

@@ -22,6 +22,11 @@ class Config:
     GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
     ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+    # Retriever / RAG (same OPENAI_API_KEY as the rest of the app)
+    RETRIEVER_CHAT_MODEL = os.getenv("RETRIEVER_CHAT_MODEL", "gpt-4o-mini")
+    RETRIEVER_FILTER_MODEL = os.getenv("RETRIEVER_FILTER_MODEL", "gpt-4o-mini")
+    RETRIEVER_EMBEDDING_MODEL = os.getenv("RETRIEVER_EMBEDDING_MODEL", "text-embedding-3-small")
     
     # Secret key for token signing (can use same as Supabase or generate a new one)
     SECRET_KEY = os.getenv("SECRET_KEY", os.getenv("SUPABASE_SECRET_KEY"))

@@ -13,12 +13,15 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from flask import Blueprint, request, jsonify, current_app
 
 from utils.auth_helpers import require_role
 from utils.document_utils import (
-    is_supported,
+    extract_supported_files_from_zip,
+    is_uploadable,
+    validate_upload_bytes,
 )
 
 
@@ -27,6 +30,87 @@ document_upload_bp = Blueprint("document_upload", __name__)
 # In-memory task hints so queued tasks can expose progress before worker starts.
 # Format: {task_id: {task_type, stage, message, total, processed, failed, ...}}
 TASK_STATUS_HINTS = {}
+
+
+def _store_and_queue_document(
+    filename: str,
+    data: bytes,
+    content_type: str,
+    *,
+    tenant_id: str,
+    user_id: str,
+    now: str,
+    supabase,
+    uploaded_documents: list,
+    batch_items: list,
+) -> Optional[str]:
+    """
+    Upload bytes to storage, insert documents or csv_registry row, append to batch_items.
+    Returns None on success, or an error message string on failure.
+    """
+    ext = Path(filename).suffix.lower()
+    storage_id = str(uuid.uuid4())
+    sanitized_filename = sanitize_filename(Path(filename).name)
+    storage_path = f"{tenant_id}/{storage_id}_{sanitized_filename}"
+
+    try:
+        storage_response = supabase.storage.from_("elorag-docs").upload(
+            storage_path,
+            data,
+            file_options={"content-type": content_type or "application/octet-stream"},
+        )
+        if not storage_response:
+            return "Failed to upload file to storage"
+    except Exception as e:
+        current_app.logger.exception(f"Storage upload failed for {filename}")
+        return f"Storage upload failed: {str(e)}"
+
+    doc_id = str(uuid.uuid4())
+    file_type = "csv" if ext == ".csv" else ext.lstrip(".")
+
+    if ext == ".csv":
+        registry_row = {
+            "id": doc_id,
+            "tenant_id": tenant_id,
+            "filename": filename,
+            "columns": [],
+            "status": "pending_processing",
+            "uploaded_by": user_id,
+            "storage_path": storage_path,
+            "row_count": 0,
+            "chunk_count": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+        supabase.table("csv_registry").insert(registry_row).execute()
+    else:
+        doc_row = {
+            "id": doc_id,
+            "tenant_id": tenant_id,
+            "filename": filename,
+            "file_type": file_type,
+            "status": "pending_processing",
+            "uploaded_by": user_id,
+            "storage_path": storage_path,
+            "chunk_count": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+        supabase.table("documents").insert(doc_row).execute()
+
+    uploaded_documents.append({
+        "document_id": doc_id,
+        "filename": filename,
+        "file_type": file_type,
+        "status": "pending_processing",
+    })
+    batch_items.append({
+        "document_id": doc_id,
+        "storage_path": storage_path,
+        "filename": filename,
+        "file_type": file_type,
+    })
+    return None
 
 
 def sanitize_filename(filename: str) -> str:
@@ -219,7 +303,8 @@ def get_task_status(task_id: str, **kwargs):
 @require_role("admin", "editor")
 def upload_document(**kwargs):
     """
-    Upload one or more documents (PDF, DOCX, CSV, or images), store in Supabase Storage, and queue for processing.
+    Upload one or more documents (PDF, DOCX, CSV, images, or .zip archives), store in Supabase Storage, and queue for processing.
+    A .zip is expanded to all supported files inside (nested folders allowed); each file is processed like a normal upload.
     Images are processed with Tesseract OCR. Supports bulk uploads - accepts multiple files in a single request.
 
     Expects multipart/form-data with file field "file" (can be multiple files).
@@ -257,10 +342,13 @@ def upload_document(**kwargs):
             filename = file.filename.strip()
             ext = Path(filename).suffix.lower()
             
-            if not is_supported(filename):
+            if not is_uploadable(filename):
                 errors.append({
                     "filename": filename,
-                    "error": f"Unsupported file type: {ext}. Supported: .pdf, .docx, .csv, and images (.jpg, .png, etc.)"
+                    "error": (
+                        f"Unsupported file type: {ext}. Supported: .pdf, .docx, .csv, .zip, "
+                        "and images (.jpg, .png, etc.)"
+                    ),
                 })
                 continue
 
@@ -272,81 +360,68 @@ def upload_document(**kwargs):
                 })
                 continue
 
-            # Generate unique storage path with sanitized filename
-            storage_id = str(uuid.uuid4())
-            sanitized_filename = sanitize_filename(filename)
-            storage_path = f"{tenant_id}/{storage_id}_{sanitized_filename}"
-            
-            # Upload to Supabase Storage bucket "elorag-docs"
-            try:
-                storage_response = supabase.storage.from_("elorag-docs").upload(
-                    storage_path,
-                    data,
-                    file_options={"content-type": file.content_type or "application/octet-stream"}
-                )
-                
-                if not storage_response:
-                    errors.append({
-                        "filename": filename,
-                        "error": "Failed to upload file to storage"
-                    })
-                    continue
-            except Exception as e:
-                current_app.logger.exception(f"Storage upload failed for {filename}")
+            # Reject corrupted/unreadable files early (avoid queuing background task failures)
+            ok, validation_error = validate_upload_bytes(filename, data)
+            if not ok:
                 errors.append({
                     "filename": filename,
-                    "error": f"Storage upload failed: {str(e)}"
+                    "error": validation_error or "Invalid file",
                 })
                 continue
 
-            # Create database record with pending_processing status
-            doc_id = str(uuid.uuid4())
-            file_type = "csv" if ext == ".csv" else ext.lstrip(".")
+            content_type = file.content_type or "application/octet-stream"
 
-            # For CSV, use csv_registry table
-            if ext == ".csv":
-                registry_row = {
-                    "id": doc_id,
-                    "tenant_id": tenant_id,
-                    "filename": filename,
-                    "columns": [],  # Will be populated during processing
-                    "status": "pending_processing",
-                    "uploaded_by": user_id,
-                    "storage_path": storage_path,
-                    "row_count": 0,
-                    "chunk_count": 0,
-                    "created_at": now,
-                    "updated_at": now,
-                }
-                supabase.table("csv_registry").insert(registry_row).execute()
+            if ext == ".zip":
+                inner_files = extract_supported_files_from_zip(data)
+                if not inner_files:
+                    errors.append({
+                        "filename": filename,
+                        "error": "Zip contains no supported files (.pdf, .docx, .csv, or images)",
+                    })
+                    continue
+                for inner_name, inner_data in inner_files:
+                    # Store only the leaf filename in DB/UI (no zip name or inner folder path)
+                    inner_stored_name = Path(inner_name).name
+                    ok_inner, err_inner = validate_upload_bytes(inner_stored_name, inner_data)
+                    if not ok_inner:
+                        errors.append({
+                            "filename": inner_stored_name,
+                            "error": err_inner or "Invalid file",
+                        })
+                        continue
+                    store_err = _store_and_queue_document(
+                        inner_stored_name,
+                        inner_data,
+                        "application/octet-stream",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        now=now,
+                        supabase=supabase,
+                        uploaded_documents=uploaded_documents,
+                        batch_items=batch_items,
+                    )
+                    if store_err:
+                        errors.append({
+                            "filename": inner_stored_name,
+                            "error": store_err,
+                        })
             else:
-                # For PDF/DOCX, use documents table
-                doc_row = {
-                    "id": doc_id,
-                    "tenant_id": tenant_id,
-                    "filename": filename,
-                    "file_type": file_type,
-                    "status": "pending_processing",
-                    "uploaded_by": user_id,
-                    "storage_path": storage_path,
-                    "chunk_count": 0,
-                    "created_at": now,
-                    "updated_at": now,
-                }
-                supabase.table("documents").insert(doc_row).execute()
-
-            uploaded_documents.append({
-                "document_id": doc_id,
-                "filename": filename,
-                "file_type": file_type,
-                "status": "pending_processing",
-            })
-            batch_items.append({
-                "document_id": doc_id,
-                "storage_path": storage_path,
-                "filename": filename,
-                "file_type": file_type,
-            })
+                store_err = _store_and_queue_document(
+                    filename,
+                    data,
+                    content_type,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    now=now,
+                    supabase=supabase,
+                    uploaded_documents=uploaded_documents,
+                    batch_items=batch_items,
+                )
+                if store_err:
+                    errors.append({
+                        "filename": filename,
+                        "error": store_err,
+                    })
 
         except Exception as e:
             current_app.logger.exception(f"Error processing file {file.filename if file else 'unknown'}")
@@ -376,8 +451,23 @@ def upload_document(**kwargs):
         }
 
     # Return response with all uploaded documents and any errors
+    if uploaded_documents:
+        upload_message = (
+            f"Uploaded {len(uploaded_documents)} document(s) to storage and queued for processing"
+        )
+    elif errors:
+        if len(errors) == 1:
+            err = errors[0]
+            upload_message = f"{err.get('filename', 'file')}: {err.get('error', 'Upload failed')}"
+        else:
+            upload_message = "No files uploaded. " + "; ".join(
+                f"{e.get('filename', 'file')}: {e.get('error', 'failed')}" for e in errors
+            )
+    else:
+        upload_message = "No files uploaded."
+
     response = {
-        "message": f"Uploaded {len(uploaded_documents)} document(s) to storage and queued for processing",
+        "message": upload_message,
         "batch_task_id": batch_task_id,
         "uploaded": uploaded_documents,
         "total_uploaded": len(uploaded_documents),
@@ -890,259 +980,4 @@ def publish_to_pinecone(**kwargs):
     }), 202
 
 
-# --- CSV Registry (Metadata Catalog) + Pinecone bridge ---
-
-@document_upload_bp.route("/csv-registry", methods=["GET"])
-@require_role("admin", "editor", "reviewer")
-def list_csv_registry(**kwargs):
-    """List CSV files for the tenant. Optional query includes draft/review/approved/pending_*."""
-    tenant_id = kwargs["tenant_id"]
-    status = request.args.get("status", "").strip().lower()
-
-    supabase = current_app.supabase_client
-    if not supabase:
-        return jsonify({"error": "Database not configured"}), 500
-
-    cols = "id, tenant_id, filename, columns, summary, status, uploaded_by, row_count, chunk_count, rejection_reason, created_at, updated_at"
-    q = supabase.table("csv_registry").select(cols).eq("tenant_id", tenant_id).order("created_at", desc=True)
-    valid_statuses = ("draft", "review", "approved", "rejected", "pending_processing", "processing_failed")
-    if status and status in valid_statuses:
-        q = q.eq("status", status)
-    result = q.execute()
-    items = result.data or []
-    return jsonify({"csv_files": items})
-
-
-@document_upload_bp.route("/csv-registry/<file_id>", methods=["GET"])
-@require_role("admin", "editor", "reviewer")
-def get_csv_file(file_id: str, **kwargs):
-    """Get one CSV file metadata and its chunks (for reviewer)."""
-    tenant_id = kwargs["tenant_id"]
-    supabase = current_app.supabase_client
-    if not supabase:
-        return jsonify({"error": "Database not configured"}), 500
-
-    reg = supabase.table("csv_registry").select("*").eq("id", file_id).eq("tenant_id", tenant_id).execute()
-    if not reg.data:
-        return jsonify({"error": "CSV file not found"}), 404
-    file_meta = reg.data[0]
-    chunks_result = (
-        supabase.table("csv_chunks")
-        .select("id, chunk_index, content, char_count")
-        .eq("csv_file_id", file_id)
-        .eq("tenant_id", tenant_id)
-        .order("chunk_index")
-        .execute()
-    )
-    chunks = chunks_result.data or []
-    return jsonify({"csv_file": file_meta, "chunks": chunks})
-
-
-@document_upload_bp.route("/csv-registry/bulk-approve", methods=["POST"])
-@require_role("admin", "reviewer")
-def bulk_approve_csv(**kwargs):
-    """
-    Bulk approve CSV files. Reviewer can approve CSV files from draft status.
-    
-    Request body:
-    {
-        "file_ids": ["uuid1", "uuid2", ...]  # Optional: if empty, approves all draft CSV files
-    }
-    
-    Returns:
-        Count of approved CSV files and list of approved IDs.
-    """
-    tenant_id = kwargs["tenant_id"]
-    current_user = kwargs["current_user"]
-    user_id = current_user["id"]
-    
-    supabase = current_app.supabase_client
-    if not supabase:
-        return jsonify({"error": "Database not configured"}), 500
-    
-    body = request.get_json(silent=True) or {}
-    file_ids = body.get("file_ids") or []
-    
-    now = datetime.now(timezone.utc).isoformat()
-    
-    # Build query for CSV files to approve
-    if file_ids:
-        # Approve specific CSV files (must be in draft or review status)
-        q = (
-            supabase.table("csv_registry")
-            .update({
-                "status": "approved",
-                "updated_at": now,
-            })
-            .eq("tenant_id", tenant_id)
-            .in_("id", file_ids)
-            .in_("status", ["draft", "review"])
-        )
-    else:
-        # Approve all draft CSV files for the tenant
-        q = (
-            supabase.table("csv_registry")
-            .update({
-                "status": "approved",
-                "updated_at": now,
-            })
-            .eq("tenant_id", tenant_id)
-            .eq("status", "draft")
-        )
-    
-    result = q.execute()
-    approved_count = len(result.data) if result.data else 0
-    approved_ids = [f["id"] for f in result.data] if result.data else []
-    
-    return jsonify({
-        "message": f"Approved {approved_count} CSV file(s)",
-        "approved_count": approved_count,
-        "approved_file_ids": approved_ids,
-        "action": "bulk_approve",
-        "actor": user_id,
-        "timestamp": now,
-    }), 200
-
-
-@document_upload_bp.route("/csv-registry/bulk-reject", methods=["POST"])
-@require_role("admin", "reviewer")
-def bulk_reject_csv(**kwargs):
-    """
-    Bulk reject CSV files. Marks CSV files as 'rejected' and stores the rejection reason.
-    Admin, reviewer, and editor can retrieve rejected CSV files and see the reason.
-    
-    Request body:
-    {
-        "file_ids": ["uuid1", "uuid2", ...],  # Required: list of CSV file IDs to reject
-        "reason": "Optional rejection reason"  # Optional: reason visible to all staff roles
-    }
-    
-    Returns:
-        Count of rejected CSV files and list of rejected IDs.
-    """
-    tenant_id = kwargs["tenant_id"]
-    current_user = kwargs["current_user"]
-    user_id = current_user["id"]
-    
-    supabase = current_app.supabase_client
-    if not supabase:
-        return jsonify({"error": "Database not configured"}), 500
-    
-    body = request.get_json(silent=True) or {}
-    file_ids = body.get("file_ids") or []
-    reason = (body.get("reason") or "").strip()
-
-    if not file_ids:
-        return jsonify({"error": "file_ids is required"}), 400
-    
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Mark CSV files as rejected (keeping record + chunks intact for visibility)
-    update_payload = {
-        "status": "rejected",
-        "rejection_reason": reason or None,
-        "updated_at": now,
-    }
-    result = (
-        supabase.table("csv_registry")
-        .update(update_payload)
-        .eq("tenant_id", tenant_id)
-        .in_("id", file_ids)
-        .execute()
-    )
-
-    rejected_ids = [f["id"] for f in result.data] if result.data else []
-    rejected_count = len(rejected_ids)
-
-    response = {
-        "message": f"Rejected {rejected_count} CSV file(s)",
-        "rejected_count": rejected_count,
-        "rejected_file_ids": rejected_ids,
-        "action": "bulk_reject",
-        "actor": user_id,
-        "timestamp": now,
-    }
-    if reason:
-        response["reason"] = reason
-
-    return jsonify(response), 200
-
-
-@document_upload_bp.route("/csv-registry/<file_id>", methods=["PATCH"])
-@require_role("admin", "editor")
-def update_csv_file(file_id: str, **kwargs):
-    """
-    Update CSV file metadata (filename, summary, etc.).
-    Only editable fields: filename, summary.
-    Status changes should use /csv-registry/<file_id>/status endpoint.
-    
-    Request body:
-    {
-        "filename": "new_filename.csv",  # Optional: new filename
-        "summary": "Updated summary"     # Optional: new summary
-    }
-    """
-    tenant_id = kwargs["tenant_id"]
-    body = request.get_json(silent=True) or {}
-    
-    supabase = current_app.supabase_client
-    if not supabase:
-        return jsonify({"error": "Database not configured"}), 500
-    
-    # Check if CSV file exists
-    csv_result = supabase.table("csv_registry").select("id, filename").eq("id", file_id).eq("tenant_id", tenant_id).execute()
-    if not csv_result.data:
-        return jsonify({"error": "CSV file not found"}), 404
-    
-    # Build update payload
-    update_payload = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    
-    # Update filename if provided
-    if "filename" in body:
-        new_filename = (body.get("filename") or "").strip()
-        if not new_filename:
-            return jsonify({"error": "filename cannot be empty"}), 400
-        update_payload["filename"] = new_filename
-    
-    # Update summary if provided
-    if "summary" in body:
-        summary = (body.get("summary") or "").strip()
-        update_payload["summary"] = summary if summary else None
-    
-    if len(update_payload) == 1:  # Only updated_at, nothing to update
-        return jsonify({"error": "No fields provided to update"}), 400
-    
-    # Update CSV file
-    result = supabase.table("csv_registry").update(update_payload).eq("id", file_id).eq("tenant_id", tenant_id).execute()
-    if not result.data:
-        return jsonify({"error": "CSV file not found"}), 404
-    
-    return jsonify({
-        "message": "CSV file updated successfully",
-        "file_id": file_id,
-        "updated_fields": {k: v for k, v in update_payload.items() if k != "updated_at"}
-    }), 200
-
-
-@document_upload_bp.route("/csv-registry/<file_id>/status", methods=["PATCH"])
-@require_role("admin", "reviewer")
-def update_csv_status(file_id: str, **kwargs):
-    """Update single CSV file status (draft | review | approved)."""
-    tenant_id = kwargs["tenant_id"]
-    body = request.get_json(silent=True) or {}
-    status = (body.get("status") or "").strip().lower()
-    if status not in ("draft", "review", "approved"):
-        return jsonify({"error": "status must be draft, review, or approved"}), 400
-    supabase = current_app.supabase_client
-    if not supabase:
-        return jsonify({"error": "Database not configured"}), 500
-    result = supabase.table("csv_registry").update({
-        "status": status,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", file_id).eq("tenant_id", tenant_id).execute()
-    if not result.data:
-        return jsonify({"error": "CSV file not found"}), 404
-    return jsonify({"file_id": file_id, "status": status}), 200
 

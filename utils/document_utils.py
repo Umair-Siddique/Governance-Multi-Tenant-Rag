@@ -14,6 +14,7 @@ from typing import BinaryIO, Iterator, List, Optional, Tuple, Union
 
 from pypdf import PdfReader
 from docx import Document
+from pypdf.errors import PdfReadError
 
 try:
     import pytesseract
@@ -31,6 +32,11 @@ SUPPORTED_DOCX_EXTENSIONS = {".docx"}
 SUPPORTED_CSV_EXTENSIONS = {".csv"}
 # Image formats processed via Tesseract OCR (PIL-openable)
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
+# Upload container (not processed by extract_and_preprocess directly)
+SUPPORTED_ZIP_EXTENSIONS = {".zip"}
+
+# Max entries returned from a single zip (supported files only); avoids zip-bomb style abuse.
+_MAX_FILES_PER_ZIP = 500
 
 
 # --- Unicode categories to strip (control, format, surrogate, private-use) ---
@@ -463,12 +469,173 @@ def get_supported_extensions() -> set:
     )
 
 
+def get_upload_extensions() -> set:
+    """Extensions allowed at upload time: processable types plus .zip archives."""
+    return get_supported_extensions() | SUPPORTED_ZIP_EXTENSIONS
+
+
 def is_supported(filename_or_ext: str) -> bool:
     """Check if the given filename or extension is supported."""
     ext = filename_or_ext.lower()
     if not ext.startswith("."):
         ext = Path(ext).suffix.lower() if "." in ext else f".{ext}"
     return ext in get_supported_extensions()
+
+
+def is_uploadable(filename_or_ext: str) -> bool:
+    """True if the file may be uploaded (supported document types or .zip)."""
+    ext = filename_or_ext.lower()
+    if not ext.startswith("."):
+        ext = Path(ext).suffix.lower() if "." in ext else f".{ext}"
+    return ext in get_upload_extensions()
+
+
+def _zip_inner_path_is_safe(name: str) -> bool:
+    """Reject zip-slip and absolute paths."""
+    if not name or name.strip() == "":
+        return False
+    norm = name.replace("\\", "/").strip("/")
+    if not norm:
+        return False
+    parts = norm.split("/")
+    if any(p == ".." or p.endswith("..") for p in parts):
+        return False
+    if parts[0].startswith("/"):
+        return False
+    return True
+
+
+def validate_zip_bytes(data: bytes) -> tuple[bool, str]:
+    """Return (ok, error_message) for a zip archive opened from bytes."""
+    if not data:
+        return False, "Empty zip file"
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+            bad = zf.testzip()
+            if bad:
+                return False, f"Corrupted zip entry: {bad}"
+        return True, ""
+    except zipfile.BadZipFile as e:
+        return False, f"Invalid or corrupted zip: {e}"
+    except Exception as e:
+        return False, f"Invalid zip: {e}"
+
+
+def extract_supported_files_from_zip(zip_bytes: bytes) -> List[Tuple[str, bytes]]:
+    """
+    List supported document files inside a zip (walks nested folders).
+
+    Returns (inner_path, file_bytes) for each file whose extension is in
+    get_supported_extensions() (PDF, DOCX, CSV, images). Skips directories,
+    macOS metadata paths, and unsupported entries. Paths use forward slashes.
+
+    At most _MAX_FILES_PER_ZIP entries are returned (oldest zip order, truncated).
+    """
+    out: List[Tuple[str, bytes]] = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename
+            if name.endswith("/"):
+                continue
+            name = name.replace("\\", "/").strip("/")
+            if not _zip_inner_path_is_safe(name):
+                continue
+            lower = name.lower()
+            if lower.startswith("__macosx/") or "__pycache__" in lower:
+                continue
+            base = Path(name).name
+            if not base or base.startswith(".") or base == ".DS_Store":
+                continue
+            ext = Path(name).suffix.lower()
+            if ext not in get_supported_extensions():
+                continue
+            try:
+                raw = zf.read(info)
+            except Exception:
+                continue
+            if not raw:
+                continue
+            out.append((name, raw))
+            if len(out) >= _MAX_FILES_PER_ZIP:
+                break
+    # Stable order for predictable batch processing
+    out.sort(key=lambda x: x[0].lower())
+    return out
+
+
+def validate_upload_bytes(filename: str, data: bytes) -> tuple[bool, str]:
+    """
+    Lightweight validation to reject corrupted/unsupported uploads before enqueueing background tasks.
+    Returns (ok, error_message). For ok=True, error_message is "".
+    """
+    try:
+        ext = Path((filename or "")).suffix.lower()
+        if not ext:
+            return False, "File has no extension"
+        if ext not in get_upload_extensions():
+            return False, f"Unsupported file type: {ext}"
+        if not data:
+            return False, "Empty file"
+
+        if ext in SUPPORTED_ZIP_EXTENSIONS:
+            ok_zip, err_zip = validate_zip_bytes(data)
+            if not ok_zip:
+                return False, err_zip or "Invalid zip file"
+            return True, ""
+
+        if ext in SUPPORTED_PDF_EXTENSIONS:
+            try:
+                reader = PdfReader(io.BytesIO(data))
+            except PdfReadError as e:
+                return False, f"Corrupted PDF: {str(e)}"
+            except Exception as e:
+                return False, f"Invalid PDF: {str(e)}"
+            try:
+                if getattr(reader, "is_encrypted", False):
+                    return False, "Password-protected PDF is not supported"
+                _ = len(reader.pages)
+            except Exception as e:
+                return False, f"Invalid PDF structure: {str(e)}"
+            return True, ""
+
+        if ext in SUPPORTED_DOCX_EXTENSIONS:
+            try:
+                Document(io.BytesIO(data))
+            except Exception as e:
+                return False, f"Corrupted DOCX: {str(e)}"
+            return True, ""
+
+        if ext in SUPPORTED_IMAGE_EXTENSIONS:
+            if not Image:
+                # If PIL isn't available, defer to background processing (won't be "corruption"-checked here).
+                return True, ""
+            try:
+                img = Image.open(io.BytesIO(data))
+                img.verify()
+            except Exception as e:
+                return False, f"Corrupted image: {str(e)}"
+            return True, ""
+
+        if ext in SUPPORTED_CSV_EXTENSIONS:
+            # Basic parse check (encoding/delimiter/header). Use existing parser for consistency.
+            try:
+                columns, rows = parse_csv(data)
+                if not columns:
+                    return False, "CSV has no header or could not be parsed"
+                if not rows:
+                    return False, "CSV has no data rows"
+            except UnicodeDecodeError:
+                return False, "CSV is not valid UTF-8"
+            except Exception as e:
+                return False, f"Invalid CSV: {str(e)}"
+            return True, ""
+
+        return True, ""
+    except Exception:
+        # Never crash upload flow due to validator bugs
+        return True, ""
 
 
 # --- CSV: column-aware parsing and row-group chunking ---
