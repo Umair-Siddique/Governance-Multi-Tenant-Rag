@@ -336,6 +336,37 @@ def _default_model_for_provider(provider: str, configured: str) -> str:
     return defaults.get(provider, Config.RETRIEVER_CHAT_MODEL)
 
 
+def _iter_text_fragments(value: Any) -> Generator[str, None, None]:
+    """
+    Normalize provider chunk payloads into plain text fragments.
+    Handles OpenAI SDK variants where content can be string/list/dict/object.
+    """
+    if value is None:
+        return
+    if isinstance(value, str):
+        if value:
+            yield value
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_text_fragments(item)
+        return
+    if isinstance(value, dict):
+        # Common shapes:
+        # {"type":"text","text":"..."}
+        # {"text":{"value":"..."}}
+        # {"content":"..."} / {"value":"..."}
+        for key in ("text", "content", "value", "output_text"):
+            if key in value:
+                yield from _iter_text_fragments(value.get(key))
+        return
+
+    # Object-like chunks from SDK models.
+    for attr in ("text", "content", "value", "output_text"):
+        if hasattr(value, attr):
+            yield from _iter_text_fragments(getattr(value, attr, None))
+
+
 def _stream_openai_chat(
     openai_client,
     model: str,
@@ -361,17 +392,27 @@ def _stream_openai_chat(
         choice = choices[0] if choices else None
         if choice is None:
             continue
-        # OpenAI SDKs/models differ: streamed text can appear under delta.content, message.content, or text.
+        # OpenAI SDKs/models differ: streamed text can appear under
+        # delta.content as string/list/object, and less often under message/text.
         delta_obj = getattr(choice, "delta", None)
         msg_obj = getattr(choice, "message", None)
-        pieces = [
-            getattr(delta_obj, "content", None) if delta_obj is not None else None,
-            getattr(msg_obj, "content", None) if msg_obj is not None else None,
-            getattr(choice, "text", None),
-        ]
-        for piece in pieces:
+        emitted_delta = False
+        for piece in _iter_text_fragments(getattr(delta_obj, "content", None) if delta_obj is not None else None):
             if piece:
+                emitted_delta = True
                 yield _sse("token", {"text": piece})
+
+        # Fallback only when no delta text was emitted for this chunk.
+        if not emitted_delta:
+            fallbacks = [
+                getattr(choice, "text", None),
+                getattr(choice, "output_text", None),
+                getattr(msg_obj, "content", None) if msg_obj is not None else None,
+            ]
+            for candidate in fallbacks:
+                for piece in _iter_text_fragments(candidate):
+                    if piece:
+                        yield _sse("token", {"text": piece})
 
 
 def _stream_anthropic_chat(
@@ -489,6 +530,8 @@ def _stream_retrieval(
     top_k: int,
     attachments: List[Tuple[str, bytes, str]],
 ) -> Generator[str, None, None]:
+    # Browser/proxy primer: force an early flush so incremental SSE tokens render sooner.
+    yield ":" + (" " * 2048) + "\n\n"
     yield _sse("status", {"stage": "received", "message": "Received your question"})
 
     supabase = getattr(current_app, "supabase_client", None)
@@ -867,7 +910,6 @@ def retriever_stream(**kwargs):
 
     headers = {
         "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
         "X-Accel-Buffering": "no",
         "Content-Type": "text/event-stream; charset=utf-8",
     }
@@ -877,4 +919,5 @@ def retriever_stream(**kwargs):
         mimetype="text/event-stream",
         headers=headers,
     )
+    response.direct_passthrough = True
     return response
