@@ -396,8 +396,18 @@ def _stream_openai_chat(
         # delta.content as string/list/object, and less often under message/text.
         delta_obj = getattr(choice, "delta", None)
         msg_obj = getattr(choice, "message", None)
+        delta_content = (
+            delta_obj.get("content")
+            if isinstance(delta_obj, dict)
+            else (getattr(delta_obj, "content", None) if delta_obj is not None else None)
+        )
+        msg_content = (
+            msg_obj.get("content")
+            if isinstance(msg_obj, dict)
+            else (getattr(msg_obj, "content", None) if msg_obj is not None else None)
+        )
         emitted_delta = False
-        for piece in _iter_text_fragments(getattr(delta_obj, "content", None) if delta_obj is not None else None):
+        for piece in _iter_text_fragments(delta_content):
             if piece:
                 emitted_delta = True
                 yield _sse("token", {"text": piece})
@@ -407,7 +417,7 @@ def _stream_openai_chat(
             fallbacks = [
                 getattr(choice, "text", None),
                 getattr(choice, "output_text", None),
-                getattr(msg_obj, "content", None) if msg_obj is not None else None,
+                msg_content,
             ]
             for candidate in fallbacks:
                 for piece in _iter_text_fragments(candidate):
@@ -919,5 +929,4 @@ def retriever_stream(**kwargs):
         mimetype="text/event-stream",
         headers=headers,
     )
-    response.direct_passthrough = True
     return response
