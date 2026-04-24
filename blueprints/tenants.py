@@ -7,6 +7,7 @@ from datetime import datetime
 from flask import Blueprint, request, jsonify, current_app
 
 from utils.auth_helpers import require_auth
+from utils.supabase_retry import execute_with_retry
 
 
 tenants_bp = Blueprint('tenants', __name__)
@@ -64,7 +65,9 @@ def upsert_tenant_profile(**kwargs):
         if not supabase:
             return jsonify({'error': 'Database not configured'}), 500
 
-        existing = supabase.table('tenants').select('*').eq('id', tenant_id).execute()
+        existing = execute_with_retry(
+            lambda: supabase.table('tenants').select('*').eq('id', tenant_id).execute()
+        )
         existing_row = existing.data[0] if existing.data else None
 
         pinecone_index_name = None
@@ -87,7 +90,9 @@ def upsert_tenant_profile(**kwargs):
         }
 
         if existing_row:
-            result = supabase.table('tenants').update(db_payload).eq('id', tenant_id).execute()
+            result = execute_with_retry(
+                lambda: supabase.table('tenants').update(db_payload).eq('id', tenant_id).execute()
+            )
             saved = result.data[0] if result.data else None
         else:
             db_payload.update({
@@ -95,7 +100,9 @@ def upsert_tenant_profile(**kwargs):
                 'pinecone_index_name': pinecone_index_name,
                 'created_at': now
             })
-            result = supabase.table('tenants').insert(db_payload).execute()
+            result = execute_with_retry(
+                lambda: supabase.table('tenants').insert(db_payload).execute()
+            )
             saved = result.data[0] if result.data else None
 
         if not saved:
@@ -128,7 +135,9 @@ def get_tenant_profile(**kwargs):
         if not supabase:
             return jsonify({'error': 'Database not configured'}), 500
 
-        result = supabase.table('tenants').select('*').eq('id', tenant_id).execute()
+        result = execute_with_retry(
+            lambda: supabase.table('tenants').select('*').eq('id', tenant_id).execute()
+        )
         if not result.data:
             return jsonify({'error': 'Tenant profile not found'}), 404
 

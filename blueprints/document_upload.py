@@ -23,6 +23,7 @@ from utils.document_utils import (
     is_uploadable,
     validate_upload_bytes,
 )
+from utils.supabase_retry import execute_with_retry
 
 
 document_upload_bp = Blueprint("document_upload", __name__)
@@ -507,7 +508,7 @@ def list_documents(**kwargs):
     doc_q = supabase.table("documents").select(doc_cols).eq("tenant_id", tenant_id)
     if status and status in valid_statuses:
         doc_q = doc_q.eq("status", status)
-    doc_result = doc_q.execute()
+    doc_result = execute_with_retry(lambda: doc_q.execute())
     doc_items = doc_result.data or []
 
     # Query csv_registry table (CSV) — normalise to same shape
@@ -515,7 +516,7 @@ def list_documents(**kwargs):
     csv_q = supabase.table("csv_registry").select(csv_cols).eq("tenant_id", tenant_id)
     if status and status in valid_statuses:
         csv_q = csv_q.eq("status", status)
-    csv_result = csv_q.execute()
+    csv_result = execute_with_retry(lambda: csv_q.execute())
     csv_items = csv_result.data or []
 
     # Tag CSV rows with file_type so the caller can tell them apart

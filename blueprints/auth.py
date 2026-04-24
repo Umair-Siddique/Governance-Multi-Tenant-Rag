@@ -404,8 +404,8 @@ def signin():
                 tenant_id = app_metadata.get('tenant_id')
 
             # ── Lazy Pinecone init ──────────────────────────────────────────
-            # Create the tenant's Pinecone index on first successful sign-in
-            # only if one hasn't been provisioned yet.
+            # Provision the tenant's Pinecone namespace on first successful sign-in
+            # only if one hasn't been recorded yet.
             if tenant_id:
                 pinecone_service = current_app.pinecone_service
                 if pinecone_service:
@@ -907,7 +907,7 @@ def _bootstrap_azure_tenant(user, user_metadata, app_metadata):
 
 
 def _lazy_pinecone_init(tenant_id):
-    """Create a Pinecone index for the tenant if one doesn't exist yet."""
+    """Provision the tenant's Pinecone namespace if not yet stored on the tenant row."""
     pinecone_service = current_app.pinecone_service
     if not pinecone_service:
         return

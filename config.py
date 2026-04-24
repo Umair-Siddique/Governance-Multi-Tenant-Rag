@@ -42,6 +42,8 @@ class Config:
     FRONTEND_URL = os.getenv("FRONTEND_URL")
 
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+    # Single serverless index; each tenant uses a dedicated Pinecone namespace.
+    PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "governance-rag")
 
     # Microsoft Entra ID (Azure AD) – OIDC via Supabase OAuth provider
     AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID")

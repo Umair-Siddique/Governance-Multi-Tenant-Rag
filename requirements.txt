@@ -8,6 +8,7 @@ cryptography
 anthropic
 mistralai
 pinecone
+langchain-core
 gunicorn
 pypdf
 python-docx

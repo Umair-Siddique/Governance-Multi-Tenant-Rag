@@ -274,3 +274,186 @@ CREATE POLICY "Tenant isolation for csv_chunks"
     WITH CHECK (
         tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
     );
+
+-- ============================================================
+-- Chat conversations & messages (per-tenant, admin vs member)
+-- chat_scope: 'admin' = tenant admins only; 'member' = editor/reviewer/user
+-- Backend uses service role + explicit filters; RLS protects direct client access.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS chat_conversations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    title VARCHAR(500) NOT NULL DEFAULT 'New conversation',
+    chat_scope VARCHAR(20) NOT NULL DEFAULT 'member'
+        CHECK (chat_scope IN ('admin', 'member')),
+    created_by UUID NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS chat_conversations_tenant_scope_updated_idx
+    ON chat_conversations (tenant_id, chat_scope, updated_at DESC);
+
+ALTER TABLE chat_conversations ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "chat_conversations tenant and scope" ON chat_conversations;
+CREATE POLICY "chat_conversations tenant and scope"
+    ON chat_conversations
+    FOR ALL
+    TO authenticated
+    USING (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+        AND (
+            (
+                chat_scope = 'admin'
+                AND COALESCE(
+                    auth.jwt()->'user_metadata'->>'role',
+                    auth.jwt()->'app_metadata'->>'role',
+                    'user'
+                ) = 'admin'
+            )
+            OR (
+                chat_scope = 'member'
+                AND COALESCE(
+                    auth.jwt()->'user_metadata'->>'role',
+                    auth.jwt()->'app_metadata'->>'role',
+                    'user'
+                ) <> 'admin'
+            )
+        )
+    )
+    WITH CHECK (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+        AND (
+            (
+                chat_scope = 'admin'
+                AND COALESCE(
+                    auth.jwt()->'user_metadata'->>'role',
+                    auth.jwt()->'app_metadata'->>'role',
+                    'user'
+                ) = 'admin'
+            )
+            OR (
+                chat_scope = 'member'
+                AND COALESCE(
+                    auth.jwt()->'user_metadata'->>'role',
+                    auth.jwt()->'app_metadata'->>'role',
+                    'user'
+                ) <> 'admin'
+            )
+        )
+    );
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id UUID NOT NULL,
+    tenant_id UUID NOT NULL,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    FOREIGN KEY (conversation_id) REFERENCES chat_conversations(id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS chat_messages_conversation_created_idx
+    ON chat_messages (conversation_id, created_at);
+
+CREATE INDEX IF NOT EXISTS chat_messages_tenant_idx ON chat_messages (tenant_id);
+
+ALTER TABLE chat_messages ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "chat_messages via conversation" ON chat_messages;
+CREATE POLICY "chat_messages via conversation"
+    ON chat_messages
+    FOR ALL
+    TO authenticated
+    USING (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+        AND EXISTS (
+            SELECT 1
+            FROM chat_conversations c
+            WHERE c.id = chat_messages.conversation_id
+              AND c.tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+              AND (
+                  (
+                      c.chat_scope = 'admin'
+                      AND COALESCE(
+                          auth.jwt()->'user_metadata'->>'role',
+                          auth.jwt()->'app_metadata'->>'role',
+                          'user'
+                      ) = 'admin'
+                  )
+                  OR (
+                      c.chat_scope = 'member'
+                      AND COALESCE(
+                          auth.jwt()->'user_metadata'->>'role',
+                          auth.jwt()->'app_metadata'->>'role',
+                          'user'
+                      ) <> 'admin'
+                  )
+              )
+        )
+    )
+    WITH CHECK (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+        AND EXISTS (
+            SELECT 1
+            FROM chat_conversations c
+            WHERE c.id = chat_messages.conversation_id
+              AND c.tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+              AND (
+                  (
+                      c.chat_scope = 'admin'
+                      AND COALESCE(
+                          auth.jwt()->'user_metadata'->>'role',
+                          auth.jwt()->'app_metadata'->>'role',
+                          'user'
+                      ) = 'admin'
+                  )
+                  OR (
+                      c.chat_scope = 'member'
+                      AND COALESCE(
+                          auth.jwt()->'user_metadata'->>'role',
+                          auth.jwt()->'app_metadata'->>'role',
+                          'user'
+                      ) <> 'admin'
+                  )
+              )
+        )
+    );
+
+-- ============================================================
+-- User preferences (per-user, per-tenant settings)
+-- v1: preferred_language (explicitly selected, no auto-detection)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS user_preferences (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+    preferred_language VARCHAR(50) NOT NULL DEFAULT 'English',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(tenant_id, user_id),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS user_preferences_tenant_user_idx
+    ON user_preferences (tenant_id, user_id);
+
+ALTER TABLE user_preferences ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "user_preferences tenant + user" ON user_preferences;
+CREATE POLICY "user_preferences tenant + user"
+    ON user_preferences
+    FOR ALL
+    TO authenticated
+    USING (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+        AND user_id = auth.uid()
+    )
+    WITH CHECK (
+        tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
+        AND user_id = auth.uid()
+    );

@@ -3,7 +3,7 @@ LLM Provider Abstraction Layer
 Supports multiple LLM providers with a unified interface
 """
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import openai
 import anthropic
 try:
@@ -418,4 +418,117 @@ class LLMProviderFactory:
             }
             return defaults.get(provider_type_lower, [])
 
+
+def resolve_tenant_openai_for_retriever(
+    supabase,
+    tenant_id: str,
+    encryption_service,
+) -> Tuple[Optional[Any], str, str, str, Optional[str]]:
+    """
+    Load the tenant's active OpenAI credentials from ``llm_providers`` for RAG/retriever.
+
+    Embeddings and chat both use OpenAI; the row's ``default_model`` is used for
+    filter planning and answer generation when set, otherwise ``Config`` defaults.
+
+    Returns:
+        (client, chat_model, filter_model, embedding_model, error_message)
+        client is None iff error_message is set.
+    """
+    from config import Config
+
+    if not supabase:
+        return None, "", "", "", "Database not configured"
+    if not encryption_service:
+        return None, "", "", "", "Encryption service not configured (ENCRYPTION_KEY)"
+
+    try:
+        result = (
+            supabase.table("llm_providers")
+            .select("encrypted_api_key, default_model")
+            .eq("tenant_id", tenant_id)
+            .eq("provider_type", "openai")
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        return None, "", "", "", f"Failed to load LLM provider: {e}"
+
+    if not result.data:
+        return (
+            None,
+            "",
+            "",
+            "",
+            "No active OpenAI provider for this tenant. Add one under LLM providers (provider_type openai).",
+        )
+
+    row = result.data[0]
+    try:
+        api_key = encryption_service.decrypt(row["encrypted_api_key"])
+    except Exception as e:
+        return None, "", "", "", f"Could not decrypt stored API key: {e}"
+
+    if not (api_key or "").strip():
+        return None, "", "", "", "OpenAI API key is missing in LLM provider settings"
+
+    default_model = (row.get("default_model") or "").strip()
+    chat_model = default_model or Config.RETRIEVER_CHAT_MODEL
+    filter_model = default_model or Config.RETRIEVER_FILTER_MODEL
+    embedding_model = Config.RETRIEVER_EMBEDDING_MODEL
+
+    try:
+        client = openai.OpenAI(api_key=api_key.strip())
+    except Exception as e:
+        return None, "", "", "", f"Invalid OpenAI client configuration: {e}"
+
+    return client, chat_model, filter_model, embedding_model, None
+
+
+def resolve_tenant_primary_answer_provider(
+    supabase,
+    tenant_id: str,
+    encryption_service,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    The tenant's active LLM provider row chosen by most recent ``updated_at``.
+    Used for the final streamed answer (OpenAI, Anthropic, or Mistral).
+
+    Returns:
+        (provider_type, decrypted_api_key, default_model, error_message)
+        Any field except error may be None when error_message is set.
+    """
+    if not supabase:
+        return None, None, None, "Database not configured"
+    if not encryption_service:
+        return None, None, None, "Encryption service not configured (ENCRYPTION_KEY)"
+
+    try:
+        result = (
+            supabase.table("llm_providers")
+            .select("provider_type, encrypted_api_key, default_model, updated_at")
+            .eq("tenant_id", tenant_id)
+            .eq("is_active", True)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        return None, None, None, f"Failed to load LLM provider: {e}"
+
+    if not result.data:
+        return None, None, None, "No active LLM provider for this tenant."
+
+    row = result.data[0]
+    ptype = (row.get("provider_type") or "").strip().lower()
+    try:
+        api_key = encryption_service.decrypt(row["encrypted_api_key"])
+    except Exception as e:
+        return None, None, None, f"Could not decrypt stored API key: {e}"
+
+    if not (api_key or "").strip():
+        return None, None, None, "API key is missing in LLM provider settings"
+
+    default_model = (row.get("default_model") or "").strip()
+    return ptype, api_key.strip(), default_model, None
 
