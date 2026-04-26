@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 
-from utils.auth_helpers import require_auth
+from utils.auth_helpers import get_user_from_token
 from utils.llm_providers import resolve_tenant_openai_for_retriever
 from utils.retriever_langchain_tools import (
     build_retrieval_tools,
@@ -85,7 +85,6 @@ def _build_context(matches: List[Any]) -> str:
 
 
 @retriever_bp.route("/retriever/query/stream", methods=["POST"])
-@require_auth
 def stream_retriever_answer(**kwargs):
     """
     Stream a tenant-scoped RAG answer as SSE.
@@ -103,26 +102,44 @@ def stream_retriever_answer(**kwargs):
     if len(query) > _MAX_QUERY_LEN:
         return jsonify({"error": f"query must be at most {_MAX_QUERY_LEN} characters"}), 400
 
-    tenant_id = kwargs["tenant_id"]
     top_k = _clamp_top_k(body.get("top_k"))
 
     def generate():
         message_id = datetime.now(timezone.utc).isoformat()
         # 1) Force immediate flush through proxy buffers (2KB+ comment padding).
-        yield _sse_comment("ping " + ("0" * 2100))
+        yield _sse_comment("ping " + ("0" * 16384))
 
-        # 2) Send start event immediately (before any retrieval).
+        # 2) Send start event immediately (before any auth/retrieval).
         yield _sse(
             "start",
             {
                 "message_id": message_id,
-                "tenant_id": tenant_id,
-                "stage": "retrieving",
+                "stage": "auth",
                 "ts": message_id,
             },
         )
 
         try:
+            user_data, auth_error = get_user_from_token()
+            if auth_error or not user_data:
+                yield _sse("error", {"message": auth_error or "Unauthorized"})
+                return
+
+            tenant_id = user_data.get("tenant_id")
+            if not tenant_id:
+                yield _sse("error", {"message": "User is not associated with a tenant"})
+                return
+
+            yield _sse(
+                "start",
+                {
+                    "message_id": message_id,
+                    "tenant_id": tenant_id,
+                    "stage": "retrieving",
+                    "ts": message_id,
+                },
+            )
+
             supabase = current_app.supabase_client
             encryption_service = getattr(current_app, "encryption_service", None)
             pinecone_service = getattr(current_app, "pinecone_service", None)
