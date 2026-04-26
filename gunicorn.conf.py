@@ -5,11 +5,14 @@ Use with:
   gunicorn -c gunicorn.conf.py wsgi:app
 """
 
-# SSE works best with an async worker.
-worker_class = "gevent"
+# SSE-friendly without gevent monkey-patching (avoids SSLSocket type issues).
+worker_class = "gthread"
 
-# Start with 1 worker to validate streaming behavior.
+# Start with 1 worker to validate streaming behavior (increase later).
 workers = 1
+
+# Threads handle concurrent requests and SSE connections.
+threads = 8
 
 # Don't kill long-lived SSE connections.
 timeout = 0

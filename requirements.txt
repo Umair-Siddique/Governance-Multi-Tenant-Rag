@@ -10,7 +10,6 @@ mistralai
 pinecone
 langchain-core
 gunicorn
-gevent
 pypdf
 python-docx
 pytesseract
