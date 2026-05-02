@@ -55,7 +55,7 @@ def _store_and_queue_document(
     storage_path = f"{tenant_id}/{storage_id}_{sanitized_filename}"
 
     try:
-        storage_response = supabase.storage.from_("elorag-docs").upload(
+        storage_response = supabase.storage.from_(current_app.config["SUPABASE_STORAGE_BUCKET"]).upload(
             storage_path,
             data,
             file_options={"content-type": content_type or "application/octet-stream"},
@@ -765,7 +765,7 @@ def delete_document(document_id: str, **kwargs):
 
         if storage_path:
             try:
-                supabase.storage.from_("elorag-docs").remove([storage_path])
+                supabase.storage.from_(current_app.config["SUPABASE_STORAGE_BUCKET"]).remove([storage_path])
             except Exception as e:
                 current_app.logger.warning(f"Failed to delete file from storage: {storage_path}, error: {str(e)}")
 
@@ -789,7 +789,7 @@ def delete_document(document_id: str, **kwargs):
 
     if storage_path:
         try:
-            supabase.storage.from_("elorag-docs").remove([storage_path])
+            supabase.storage.from_(current_app.config["SUPABASE_STORAGE_BUCKET"]).remove([storage_path])
         except Exception as e:
             current_app.logger.warning(f"Failed to delete file from storage: {storage_path}, error: {str(e)}")
 

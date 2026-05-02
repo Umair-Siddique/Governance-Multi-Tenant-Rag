@@ -5,7 +5,6 @@ from utils.token_service import TokenService
 from utils.encryption_service import EncryptionService
 from utils.pinecone_service import PineconeService
 from openai import OpenAI
-from celery import Celery
 
 
 def init_supabase(app):
@@ -70,33 +69,17 @@ def init_pinecone_service(app):
 
 def init_openai_service(app):
     """Initialize OpenAI Service"""
-    app.openai_service = OpenAI(api_key=Config.OPENAI_API_KEY)
+    if Config.OPENAI_API_KEY:
+        app.openai_service = OpenAI(api_key=Config.OPENAI_API_KEY)
+        print("✅ OpenAI service initialized successfully")
+    else:
+        app.openai_service = None
+        print("⚠️  OpenAI not configured - embeddings and default chat disabled")
 
 
 def init_celery(app):
-    """Initialize Celery"""
-    celery = Celery(
-        app.import_name,
-        broker=Config.CELERY_BROKER_URL,
-        backend=Config.CELERY_RESULT_BACKEND,
-    )
-    celery.conf.update(
-        task_serializer='json',
-        accept_content=['json'],
-        result_serializer='json',
-        timezone='UTC',
-        enable_utc=True,
-        task_track_started=True,
-    )
-    
-    # Make Celery use Flask app context
-    class ContextTask(celery.Task):
-        def __call__(self, *args, **kwargs):
-            with app.app_context():
-                return self.run(*args, **kwargs)
-    
-    celery.Task = ContextTask
-    app.celery = celery
-    
+    """Initialize Celery and register all background tasks."""
+    from tasks.document_tasks import init_celery_from_app
+    celery = init_celery_from_app(app)
     print("✅ Celery initialized successfully")
     return celery

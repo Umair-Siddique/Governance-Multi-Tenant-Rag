@@ -15,11 +15,11 @@ llm_providers_bp = Blueprint('llm_providers', __name__)
 
 
 def get_encryption_service() -> EncryptionService:
-    """Get encryption service instance"""
-    encryption_key = current_app.config.get('ENCRYPTION_KEY')
-    if not encryption_key:
+    """Get the app-level encryption service instance."""
+    svc = current_app.encryption_service
+    if not svc:
         raise ValueError("ENCRYPTION_KEY not configured")
-    return EncryptionService(encryption_key)
+    return svc
 
 
 def validate_provider_data(data: dict):

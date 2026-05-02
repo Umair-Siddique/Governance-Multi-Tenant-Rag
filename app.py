@@ -1,7 +1,15 @@
 from flask import Flask
 from config import Config
 
-from extensions import init_openai_service, init_supabase, init_email_service, init_token_service, init_encryption_service, init_pinecone_service
+from extensions import (
+    init_supabase,
+    init_email_service,
+    init_token_service,
+    init_encryption_service,
+    init_pinecone_service,
+    init_openai_service,
+    init_celery,
+)
 
 from blueprints.auth import auth_bp
 from blueprints.llm_providers import llm_providers_bp
@@ -35,8 +43,7 @@ def create_app():
     init_openai_service(app)
     
     # Initialize Celery tasks with app context
-    from tasks.document_tasks import init_celery_from_app
-    init_celery_from_app(app)
+    init_celery(app)
 
     # Register blueprints
     app.register_blueprint(auth_bp, url_prefix="/auth")
@@ -50,16 +57,5 @@ def create_app():
     app.register_blueprint(retriever_bp, url_prefix="/api")
     app.register_blueprint(chats_bp, url_prefix="/api")
     app.register_blueprint(user_preferences_bp, url_prefix="/api")
-
-    @app.after_request
-    def enforce_sse_streaming_headers(response):
-        ctype = (response.headers.get("Content-Type") or "").lower()
-        if "text/event-stream" in ctype:
-            # Keep SSE unbuffered/untransformed for browser streaming.
-            response.headers["Cache-Control"] = "no-cache, no-transform"
-            response.headers["X-Accel-Buffering"] = "no"
-            response.headers.pop("Content-Encoding", None)
-            response.headers.pop("Content-Length", None)
-        return response
 
     return app

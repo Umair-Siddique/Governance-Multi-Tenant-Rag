@@ -45,6 +45,9 @@ class Config:
     # Single serverless index; each tenant uses a dedicated Pinecone namespace.
     PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "governance-rag")
 
+    # Supabase Storage bucket name for document uploads
+    SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "elorag-docs")
+
     # Microsoft Entra ID (Azure AD) – OIDC via Supabase OAuth provider
     AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
     AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
