@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import requests as http_requests
 from flask import Blueprint, request, jsonify, current_app
 
+from utils.audit import log_audit_event
 from utils.auth_helpers import require_role
 
 # Admin CRUD routes  →  registered under /api
@@ -179,6 +180,24 @@ def send_invitation(**kwargs):
             supabase.table('tenant_invitations').delete().eq('id', invitation_id).execute()
             return jsonify({'error': 'Failed to send invitation email'}), 500
 
+        log_audit_event(
+            supabase,
+            tenant_id=tenant_id,
+            event_category="admin",
+            event_type="admin.user_invited",
+            actor_id=str(inviter_user_id),
+            actor_email=inviter_email,
+            actor_role=kwargs.get("user_role"),
+            target_type="user",
+            metadata={
+                "invited_email": invited_email,
+                "role": role,
+                "invitation_id": invitation_id,
+                "expires_at": expires,
+            },
+            ip_address=request.remote_addr,
+        )
+
         return jsonify({
             'message': f'Invitation sent to {invited_email}',
             'invitation': {
@@ -282,6 +301,23 @@ def revoke_invitation(invitation_id, **kwargs):
 
         # Mark as revoked (soft delete for audit trail)
         supabase.table('tenant_invitations').update({'status': 'revoked'}).eq('id', invitation_id).execute()
+
+        log_audit_event(
+            supabase,
+            tenant_id=tenant_id,
+            event_category="admin",
+            event_type="admin.invitation_revoked",
+            actor_id=str(kwargs['current_user']['id']),
+            actor_email=kwargs['current_user'].get('email'),
+            actor_role=kwargs.get('user_role'),
+            target_type="user",
+            metadata={
+                "invitation_id": invitation_id,
+                "invited_email": invite['invited_email'],
+                "role": invite['role'],
+            },
+            ip_address=request.remote_addr,
+        )
 
         return jsonify({'message': 'Invitation revoked successfully'}), 200
 
@@ -509,6 +545,21 @@ def accept_invite(token):
                 role=role,
                 tenant_name=tenant_name,
             )
+
+        log_audit_event(
+            supabase,
+            tenant_id=tenant_id,
+            event_category="admin",
+            event_type="admin.user_registered",
+            actor_id=str(new_user_id),
+            actor_email=new_user_email,
+            target_type="user",
+            metadata={
+                "invitation_id": invitation_id,
+                "role": role,
+                "invited_by": str(inv.get("invited_by") or ""),
+            },
+        )
 
         return jsonify({
             'message': 'Account created successfully. You can now sign in.',

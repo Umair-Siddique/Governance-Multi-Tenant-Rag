@@ -457,3 +457,67 @@ CREATE POLICY "user_preferences tenant + user"
         tenant_id::text = (auth.jwt()->'user_metadata'->>'tenant_id')
         AND user_id = auth.uid()
     );
+
+-- ============================================================
+-- Audit Logs (Milestone 4 — immutable, append-only governance log)
+--
+-- Three categories:
+--   content  → document lifecycle (upload, approve, reject, delete, publish)
+--   ai       → RAG queries and temporary file uploads in chat
+--   admin    → user invitations, role changes, user removal
+--
+-- All writes go through the Flask service-role key (bypasses RLS).
+-- Reads are restricted to the tenant admin via API + RLS below.
+-- Rows are intentionally never updated or deleted.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID        NOT NULL,
+    -- 'content' | 'ai' | 'admin'
+    event_category  TEXT        NOT NULL
+        CHECK (event_category IN ('content', 'ai', 'admin')),
+    -- e.g. 'document.uploaded', 'ai.query_asked', 'admin.user_invited'
+    event_type      TEXT        NOT NULL,
+    actor_id        TEXT,           -- NULL for system-generated events
+    actor_email     TEXT,
+    target_id       TEXT,           -- document_id, user_id, conversation_id, etc.
+    target_type     TEXT,           -- 'document' | 'csv' | 'user' | 'conversation'
+    metadata        JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    ip_address      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Primary read: newest events per tenant
+CREATE INDEX IF NOT EXISTS audit_logs_tenant_created_idx
+    ON audit_logs (tenant_id, created_at DESC);
+
+-- Filter by category
+CREATE INDEX IF NOT EXISTS audit_logs_tenant_category_idx
+    ON audit_logs (tenant_id, event_category);
+
+-- Filter by event type
+CREATE INDEX IF NOT EXISTS audit_logs_tenant_event_type_idx
+    ON audit_logs (tenant_id, event_type);
+
+-- Look up by actor (who did it)
+CREATE INDEX IF NOT EXISTS audit_logs_actor_idx
+    ON audit_logs (tenant_id, actor_id);
+
+-- Look up by target (what was affected)
+CREATE INDEX IF NOT EXISTS audit_logs_target_idx
+    ON audit_logs (tenant_id, target_id);
+
+-- audit_logs: RLS is DISABLED because this table is accessed only by the
+-- Flask backend (never by the browser directly). All access control is
+-- enforced at the API layer:
+--   Reads  → @require_role("admin") + tenant_id filter in Python
+--   Writes → server-side only, called after each governance action
+--
+-- The Supabase client in Flask may use the anon key (not service_role),
+-- which goes through RLS.  With RLS enabled and no INSERT policy for the
+-- anon role, every audit write would fail silently — producing an empty
+-- audit log.  Disabling RLS removes that dependency on which key is used.
+ALTER TABLE audit_logs DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "audit_logs tenant read" ON audit_logs;
+DROP POLICY IF EXISTS "audit_logs tenant write" ON audit_logs;

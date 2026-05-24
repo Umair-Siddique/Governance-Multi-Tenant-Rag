@@ -26,6 +26,7 @@ from flask import Blueprint, Response, current_app, jsonify, request, stream_wit
 from werkzeug.utils import secure_filename
 
 from config import Config
+from utils.audit import log_audit_event
 from utils.auth_helpers import require_auth
 from utils.document_utils import extract_text_from_docx, extract_text_from_image, extract_text_from_pdf
 from utils.llm_providers import resolve_tenant_openai_for_retriever, resolve_tenant_primary_answer_provider
@@ -385,7 +386,6 @@ def _stream_openai_chat(
             {"role": "user", "content": user_content},
         ],
         stream=True,
-        temperature=0.3,
     )
     for chunk in stream:
         choices = getattr(chunk, "choices", None) or []
@@ -539,10 +539,46 @@ def _stream_retrieval(
     user_query: str,
     top_k: int,
     attachments: List[Tuple[str, bytes, str]],
+    actor_email: str = "",
+    actor_role: str = "user",
+    ip_address: str = "",
 ) -> Generator[str, None, None]:
     yield _sse("status", {"stage": "received", "message": "Received your question"})
 
     supabase = getattr(current_app, "supabase_client", None)
+
+    # Log the incoming query and any temporary file uploads
+    log_audit_event(
+        supabase,
+        tenant_id=tenant_id,
+        event_category="ai",
+        event_type="ai.query_asked",
+        actor_id=user_id,
+        actor_email=actor_email or None,
+        actor_role=actor_role or None,
+        ip_address=ip_address or None,
+        metadata={
+            "top_k": top_k,
+            "has_attachments": bool(attachments),
+            "attachment_count": len(attachments),
+        },
+    )
+    for _fname, _data, _ctype in attachments:
+        log_audit_event(
+            supabase,
+            tenant_id=tenant_id,
+            event_category="ai",
+            event_type="ai.temp_file_uploaded",
+            actor_id=user_id,
+            actor_email=actor_email or None,
+            actor_role=actor_role or None,
+            ip_address=ip_address or None,
+            metadata={
+                "filename": _fname,
+                "content_type": _ctype,
+                "confirmed_non_indexed": True,
+            },
+        )
     encryption_service = getattr(current_app, "encryption_service", None)
     openai_client, chat_model_oai, filter_model, embedding_model, llm_err = (
         resolve_tenant_openai_for_retriever(supabase, tenant_id, encryption_service)
@@ -918,7 +954,14 @@ def retriever_stream(**kwargs):
     ``legacy_planner``) and, for tool retrieval, ``tool_trace`` describing each tool call.
     """
     tenant_id = kwargs["tenant_id"]
-    user_id = str((kwargs.get("current_user") or {}).get("id") or "").strip()
+    current_user = kwargs.get("current_user") or {}
+    user_id = str(current_user.get("id") or "").strip()
+    user_meta = current_user.get("user_metadata") or {}
+    app_meta = current_user.get("app_metadata") or {}
+    actor_email = current_user.get("email") or ""
+    actor_role = user_meta.get("role") or app_meta.get("role") or "user"
+    ip_address = request.remote_addr or ""
+
     user_query, top_k, attachments = _parse_stream_request()
     if not user_query:
         return jsonify({"error": "query (or question) is required"}), 400
@@ -930,7 +973,10 @@ def retriever_stream(**kwargs):
     }
 
     response = Response(
-        stream_with_context(_stream_retrieval(tenant_id, user_id, user_query, top_k, attachments)),
+        stream_with_context(_stream_retrieval(
+            tenant_id, user_id, user_query, top_k, attachments,
+            actor_email=actor_email, actor_role=actor_role, ip_address=ip_address,
+        )),
         mimetype="text/event-stream",
         headers=headers,
     )

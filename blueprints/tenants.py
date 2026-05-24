@@ -37,10 +37,14 @@ def _normalize_payload(data: dict):
     if not isinstance(tenant_details, dict):
         return None, "tenant_details must be a JSON object"
 
+    raw_domain = data.get('custom_domain')
+    custom_domain = raw_domain.strip().lower() if raw_domain and isinstance(raw_domain, str) else None
+
     return {
         'tenant_name': tenant_name,
         'tenant_type': tenant_type,
-        'tenant_details': tenant_details
+        'tenant_details': tenant_details,
+        'custom_domain': custom_domain,
     }, None
 
 
@@ -86,6 +90,7 @@ def upsert_tenant_profile(**kwargs):
             'tenant_name': normalized['tenant_name'],
             'tenant_type': normalized['tenant_type'],
             'tenant_details': normalized['tenant_details'],
+            'custom_domain': normalized['custom_domain'],
             'updated_at': now
         }
 
@@ -115,6 +120,7 @@ def upsert_tenant_profile(**kwargs):
                 'tenant_name': saved.get('tenant_name'),
                 'tenant_type': saved.get('tenant_type'),
                 'tenant_details': saved.get('tenant_details') or {},
+                'custom_domain': saved.get('custom_domain'),
                 'pinecone_index_name': saved.get('pinecone_index_name'),
                 'created_at': saved.get('created_at'),
                 'updated_at': saved.get('updated_at')
@@ -148,6 +154,7 @@ def get_tenant_profile(**kwargs):
                 'tenant_name': tenant.get('tenant_name'),
                 'tenant_type': tenant.get('tenant_type'),
                 'tenant_details': tenant.get('tenant_details') or {},
+                'custom_domain': tenant.get('custom_domain'),
                 'pinecone_index_name': tenant.get('pinecone_index_name'),
                 'created_at': tenant.get('created_at'),
                 'updated_at': tenant.get('updated_at')

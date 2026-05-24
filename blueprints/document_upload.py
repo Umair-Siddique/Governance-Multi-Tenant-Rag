@@ -17,6 +17,7 @@ from typing import Optional
 
 from flask import Blueprint, request, jsonify, current_app
 
+from utils.audit import log_audit_event
 from utils.auth_helpers import require_role
 from utils.document_utils import (
     extract_supported_files_from_zip,
@@ -432,24 +433,47 @@ def upload_document(**kwargs):
             })
             continue
 
-    # Dispatch ONE batch task for all successfully uploaded documents
+    # Dispatch ONE batch task for all successfully uploaded documents.
+    # Audit in a finally block so uploads are still logged if Celery enqueue fails.
     batch_task_id = None
-    if batch_items:
-        from tasks.document_tasks import process_document_batch
-        batch_task = process_document_batch.delay(
-            tenant_id=tenant_id,
-            batch_items=batch_items,
-        )
-        batch_task_id = batch_task.id
-        TASK_STATUS_HINTS[batch_task_id] = {
-            "task_type": "document_batch",
-            "stage": "queued",
-            "message": "Task queued for processing",
-            "total": len(batch_items),
-            "processed": 0,
-            "failed": 0,
-            "progress_percent": 0,
-        }
+    try:
+        if batch_items:
+            from tasks.document_tasks import process_document_batch
+            batch_task = process_document_batch.delay(
+                tenant_id=tenant_id,
+                batch_items=batch_items,
+            )
+            batch_task_id = batch_task.id
+            TASK_STATUS_HINTS[batch_task_id] = {
+                "task_type": "document_batch",
+                "stage": "queued",
+                "message": "Task queued for processing",
+                "total": len(batch_items),
+                "processed": 0,
+                "failed": 0,
+                "progress_percent": 0,
+            }
+    finally:
+        _actor_email = current_user.get("email")
+        _actor_role = kwargs.get("user_role")
+        for _doc in uploaded_documents:
+            log_audit_event(
+                supabase,
+                tenant_id=tenant_id,
+                event_category="content",
+                event_type="document.uploaded",
+                actor_id=user_id,
+                actor_email=_actor_email,
+                actor_role=_actor_role,
+                target_id=_doc["document_id"],
+                target_type=_doc["file_type"],
+                metadata={
+                    "filename": _doc["filename"],
+                    "file_type": _doc["file_type"],
+                    "batch_task_id": batch_task_id,
+                },
+                ip_address=request.remote_addr,
+            )
 
     # Return response with all uploaded documents and any errors
     if uploaded_documents:
@@ -656,6 +680,22 @@ def bulk_approve_documents(**kwargs):
     approved_csv_ids = [r["id"] for r in (csv_result.data if csv_result else [])]
     approved_ids = approved_doc_ids + approved_csv_ids
 
+    log_audit_event(
+        supabase,
+        tenant_id=tenant_id,
+        event_category="content",
+        event_type="document.batch_approved",
+        actor_id=user_id,
+        actor_email=current_user.get("email"),
+        actor_role=kwargs.get("user_role"),
+        metadata={
+            "approved_count": len(approved_ids),
+            "approved_document_ids": approved_ids,
+            "requested_ids": document_ids,
+        },
+        ip_address=request.remote_addr,
+    )
+
     return jsonify({
         "message": f"Approved {len(approved_ids)} document(s)",
         "approved_count": len(approved_ids),
@@ -729,6 +769,22 @@ def bulk_reject_documents(**kwargs):
     rejected_csv_ids = [r["id"] for r in (csv_result.data if csv_result else [])]
     rejected_ids = rejected_doc_ids + rejected_csv_ids
 
+    log_audit_event(
+        supabase,
+        tenant_id=tenant_id,
+        event_category="content",
+        event_type="document.batch_rejected",
+        actor_id=user_id,
+        actor_email=current_user.get("email"),
+        actor_role=kwargs.get("user_role"),
+        metadata={
+            "rejected_count": len(rejected_ids),
+            "rejected_document_ids": rejected_ids,
+            "reason": reason or None,
+        },
+        ip_address=request.remote_addr,
+    )
+
     response = {
         "message": f"Rejected {len(rejected_ids)} document(s)",
         "rejected_count": len(rejected_ids),
@@ -773,6 +829,23 @@ def delete_document(document_id: str, **kwargs):
         if not delete_result.data:
             return jsonify({"error": "Document not found or already deleted"}), 404
 
+        log_audit_event(
+            supabase,
+            tenant_id=tenant_id,
+            event_category="content",
+            event_type="document.deleted",
+            actor_id=str(kwargs["current_user"]["id"]),
+            actor_email=kwargs["current_user"].get("email"),
+            actor_role=kwargs.get("user_role"),
+            target_id=document_id,
+            target_type=doc.get("file_type", "document"),
+            metadata={
+                "filename": doc.get("filename"),
+                "storage_path": storage_path,
+            },
+            ip_address=request.remote_addr,
+        )
+
         return jsonify({
             "message": "Document deleted successfully",
             "document_id": document_id,
@@ -797,6 +870,23 @@ def delete_document(document_id: str, **kwargs):
     if not delete_result.data:
         return jsonify({"error": "CSV file not found or already deleted"}), 404
 
+    log_audit_event(
+        supabase,
+        tenant_id=tenant_id,
+        event_category="content",
+        event_type="document.deleted",
+        actor_id=str(kwargs["current_user"]["id"]),
+        actor_email=kwargs["current_user"].get("email"),
+        actor_role=kwargs.get("user_role"),
+        target_id=document_id,
+        target_type="csv",
+        metadata={
+            "filename": csv_file.get("filename"),
+            "storage_path": storage_path,
+        },
+        ip_address=request.remote_addr,
+    )
+
     return jsonify({
         "message": "CSV file deleted successfully",
         "document_id": document_id,
@@ -809,20 +899,47 @@ def delete_document(document_id: str, **kwargs):
 def update_document_status(document_id: str, **kwargs):
     """Update single document status (draft | review | approved)."""
     tenant_id = kwargs["tenant_id"]
+    current_user = kwargs["current_user"]
     body = request.get_json(silent=True) or {}
-    status = (body.get("status") or "").strip().lower()
-    if status not in ("draft", "review", "approved"):
+    new_status = (body.get("status") or "").strip().lower()
+    if new_status not in ("draft", "review", "approved"):
         return jsonify({"error": "status must be draft, review, or approved"}), 400
     supabase = current_app.supabase_client
     if not supabase:
         return jsonify({"error": "Database not configured"}), 500
+
+    # Fetch current status so we can log the transition
+    old_row = supabase.table("documents").select("status, filename, file_type").eq("id", document_id).eq("tenant_id", tenant_id).execute()
+    old_status = (old_row.data[0].get("status") if old_row.data else None)
+    filename = (old_row.data[0].get("filename") if old_row.data else None)
+    file_type = (old_row.data[0].get("file_type") if old_row.data else None)
+
     result = supabase.table("documents").update({
-        "status": status,
+        "status": new_status,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", document_id).eq("tenant_id", tenant_id).execute()
     if not result.data:
         return jsonify({"error": "Document not found"}), 404
-    return jsonify({"document_id": document_id, "status": status}), 200
+
+    log_audit_event(
+        supabase,
+        tenant_id=tenant_id,
+        event_category="content",
+        event_type="document.status_changed",
+        actor_id=str(current_user["id"]),
+        actor_email=current_user.get("email"),
+        actor_role=kwargs.get("user_role"),
+        target_id=document_id,
+        target_type=file_type or "document",
+        metadata={
+            "filename": filename,
+            "old_status": old_status,
+            "new_status": new_status,
+        },
+        ip_address=request.remote_addr,
+    )
+
+    return jsonify({"document_id": document_id, "status": new_status}), 200
 
 
 @document_upload_bp.route("/documents/bulk-submit-review", methods=["POST"])
@@ -924,6 +1041,23 @@ def bulk_submit_documents_for_review(**kwargs):
 
     moved_ids = moved_doc_ids + moved_csv_ids
 
+    log_audit_event(
+        supabase,
+        tenant_id=tenant_id,
+        event_category="content",
+        event_type="document.batch_submitted_for_review",
+        actor_id=user_id,
+        actor_email=current_user.get("email"),
+        actor_role=kwargs.get("user_role"),
+        metadata={
+            "submitted_count": len(moved_ids),
+            "submitted_document_ids": moved_ids,
+            "skipped_non_draft_ids": non_draft_ids,
+            "not_found_ids": not_found_ids,
+        },
+        ip_address=request.remote_addr,
+    )
+
     response = {
         "message": f"Submitted {len(moved_ids)} item(s) for review",
         "submitted_count": len(moved_ids),
@@ -973,7 +1107,25 @@ def publish_to_pinecone(**kwargs):
         "requested_file_ids": len(file_ids),
         "progress_percent": 0,
     }
-    
+
+    _current_user = kwargs.get("current_user") or {}
+    _actor_id = _current_user.get("id")
+    log_audit_event(
+        current_app.supabase_client,
+        tenant_id=tenant_id,
+        event_category="content",
+        event_type="document.published_to_pinecone",
+        actor_id=str(_actor_id) if _actor_id else None,
+        actor_email=_current_user.get("email"),
+        actor_role=kwargs.get("user_role"),
+        metadata={
+            "task_id": task.id,
+            "requested_document_ids": document_ids,
+            "requested_file_ids": file_ids,
+        },
+        ip_address=request.remote_addr,
+    )
+
     return jsonify({
         "message": "Publish to Pinecone queued for processing",
         "task_id": task.id,

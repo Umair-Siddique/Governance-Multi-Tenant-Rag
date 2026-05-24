@@ -19,6 +19,8 @@ from blueprints.document_upload import document_upload_bp
 from blueprints.retriever import retriever_bp
 from blueprints.chats import chats_bp
 from blueprints.user_preferences import user_preferences_bp
+from blueprints.audit_logs import audit_logs_bp
+from blueprints.branding import branding_bp
 
 from flask_cors import CORS
 
@@ -26,8 +28,8 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
-    CORS(app, 
-         supports_credentials=True, 
+    CORS(app,
+         supports_credentials=True,
          origins=["https://governance-saas.vercel.app", "http://localhost:5173", "https://governance-multi-tenant-ui.vercel.app"],
          methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
          allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
@@ -57,5 +59,7 @@ def create_app():
     app.register_blueprint(retriever_bp, url_prefix="/api")
     app.register_blueprint(chats_bp, url_prefix="/api")
     app.register_blueprint(user_preferences_bp, url_prefix="/api")
+    app.register_blueprint(branding_bp, url_prefix="/api")
+    app.register_blueprint(audit_logs_bp, url_prefix="/api")
 
     return app

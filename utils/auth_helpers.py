@@ -2,9 +2,30 @@
 Authentication helper utilities
 Functions for extracting user and tenant information from JWT tokens
 """
+import uuid
 from flask import request, current_app, jsonify
 from functools import wraps
 from typing import Optional, Tuple
+
+
+def canonical_tenant_id(tenant_id) -> Optional[str]:
+    """
+    Normalize tenant_id from JWT / DB for consistent comparisons and FK writes.
+
+    Invited users and self-registered admins may store the same logical tenant as
+    slightly different string shapes; Postgres UUID comparisons are safe, but
+    PostgREST filters and audit_logs inserts must use one canonical form so rows
+    are visible when the tenant owner lists logs.
+    """
+    if tenant_id is None:
+        return None
+    s = str(tenant_id).strip()
+    if not s:
+        return None
+    try:
+        return str(uuid.UUID(s))
+    except (ValueError, TypeError, AttributeError):
+        return s
 
 
 def get_user_from_token() -> Tuple[Optional[dict], Optional[str]]:
@@ -40,21 +61,18 @@ def get_user_from_token() -> Tuple[Optional[dict], Optional[str]]:
         
         user = user_response.user
         
-        # Extract tenant_id from user_metadata
+        # Extract tenant_id from user_metadata, then app_metadata (invitees often have both)
         user_metadata = getattr(user, 'user_metadata', {}) or {}
-        tenant_id = user_metadata.get('tenant_id')
-        
-        # If tenant_id not in metadata, try to get from app_metadata
-        if not tenant_id:
-            app_metadata = getattr(user, 'app_metadata', {}) or {}
-            tenant_id = app_metadata.get('tenant_id')
-        
+        app_metadata = getattr(user, 'app_metadata', {}) or {}
+        raw_tenant = user_metadata.get('tenant_id') or app_metadata.get('tenant_id')
+        tenant_id = canonical_tenant_id(raw_tenant) if raw_tenant else None
+
         user_data = {
             'id': user.id,
             'email': user.email,
             'tenant_id': tenant_id,
             'user_metadata': user_metadata,
-            'app_metadata': getattr(user, 'app_metadata', {}) or {}
+            'app_metadata': app_metadata,
         }
         
         return user_data, None
