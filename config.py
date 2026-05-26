@@ -60,3 +60,6 @@ class Config:
     # Celery configuration
     CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
     CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")
+
+    # White-label root domain (subdomains like <slug>.<ROOT_DOMAIN> are white-label portals)
+    ROOT_DOMAIN = os.getenv("ROOT_DOMAIN", "elorag.com")

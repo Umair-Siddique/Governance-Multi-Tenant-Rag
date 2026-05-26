@@ -2,6 +2,7 @@
 Tenant profile APIs
 Stores tenant onboarding details in the existing tenants table.
 """
+import re
 from datetime import datetime
 
 from flask import Blueprint, request, jsonify, current_app
@@ -13,6 +14,11 @@ from utils.supabase_retry import execute_with_retry
 tenants_bp = Blueprint('tenants', __name__)
 
 ALLOWED_TENANT_TYPES = {'self_managed', 'white_label'}
+_RESERVED_SLUGS = frozenset({'www', 'api', 'admin', 'app', 'auth', 'mail'})
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
 
 
 def _default_index_name(tenant_id: str) -> str:
@@ -30,6 +36,12 @@ def _normalize_payload(data: dict):
     tenant_type = (data.get('tenant_type') or 'self_managed').strip().lower()
     if tenant_type not in ALLOWED_TENANT_TYPES:
         return None, f"tenant_type must be one of: {sorted(ALLOWED_TENANT_TYPES)}"
+
+    # White-label tenants claim a subdomain via their slug; reject reserved names.
+    if tenant_type == 'white_label':
+        slug = _slugify(tenant_name)
+        if slug in _RESERVED_SLUGS:
+            return None, f"tenant_name '{tenant_name}' resolves to reserved slug '{slug}'"
 
     tenant_details = data.get('tenant_details', {})
     if tenant_details is None:

@@ -28,9 +28,19 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
+    # r"https://[a-z0-9][a-z0-9-]*\.elorag\.com$" matches any white-label subdomain.
+    # Flask-CORS evaluates each origin with re.match(), so the trailing $ is required
+    # to prevent prefix attacks like https://tenant.elorag.com.evil.com.
     CORS(app,
          supports_credentials=True,
-         origins=["https://governance-saas.vercel.app", "http://localhost:5173", "https://governance-multi-tenant-ui.vercel.app", "https://www.elorag.com", "https://elorag.com"],
+         origins=[
+             "https://governance-saas.vercel.app",
+             "http://localhost:5173",
+             "https://governance-multi-tenant-ui.vercel.app",
+             "https://www.elorag.com",
+             "https://elorag.com",
+             r"https://[a-z0-9][a-z0-9-]*\.elorag\.com$",
+         ],
          methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
          allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
          expose_headers=['Content-Type', 'Authorization']
