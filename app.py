@@ -30,7 +30,7 @@ def create_app():
 
     CORS(app,
          supports_credentials=True,
-         origins=["https://governance-saas.vercel.app", "http://localhost:5173", "https://governance-multi-tenant-ui.vercel.app"],
+         origins=["https://governance-saas.vercel.app", "http://localhost:5173", "https://governance-multi-tenant-ui.vercel.app", "https://www.elorag.com", "https://elorag.com"],
          methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
          allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
          expose_headers=['Content-Type', 'Authorization']
