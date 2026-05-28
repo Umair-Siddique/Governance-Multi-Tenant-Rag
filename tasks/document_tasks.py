@@ -562,6 +562,26 @@ def _publish_to_pinecone_impl(self, tenant_id: str, document_ids: list = None, f
             chunks_prepared=len(all_vectors),
         )
         pinecone_service.upsert_vectors(tenant_id, all_vectors)
+
+        # Mark successfully published rows so list APIs can expose publish status.
+        if docs_published > 0 and docs:
+            published_doc_ids = [d["id"] for d in docs]
+            (
+                supabase.table("documents")
+                .update({"published_to_pinecone": True})
+                .eq("tenant_id", tenant_id)
+                .in_("id", published_doc_ids)
+                .execute()
+            )
+        if csv_files_published > 0 and csv_files:
+            published_csv_ids = [f["id"] for f in csv_files]
+            (
+                supabase.table("csv_registry")
+                .update({"published_to_pinecone": True})
+                .eq("tenant_id", tenant_id)
+                .in_("id", published_csv_ids)
+                .execute()
+            )
         
         return {
             "message": "Content published to vector store",

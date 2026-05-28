@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS documents (
     uploaded_by UUID NOT NULL,
     raw_text TEXT,
     chunk_count INTEGER DEFAULT 0,
+    published_to_pinecone BOOLEAN NOT NULL DEFAULT false,
     storage_path VARCHAR(1000),
     rejection_reason TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -142,6 +143,7 @@ ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_status_check;
 ALTER TABLE documents ADD CONSTRAINT documents_status_check
     CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed', 'rejected'));
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS published_to_pinecone BOOLEAN NOT NULL DEFAULT false;
 
 -- Enable RLS
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
@@ -208,6 +210,7 @@ CREATE TABLE IF NOT EXISTS csv_registry (
     uploaded_by UUID NOT NULL,
     row_count INTEGER DEFAULT 0,
     chunk_count INTEGER DEFAULT 0,
+    published_to_pinecone BOOLEAN NOT NULL DEFAULT false,
     storage_path VARCHAR(1000),
     rejection_reason TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -226,6 +229,7 @@ ALTER TABLE csv_registry DROP CONSTRAINT IF EXISTS csv_registry_status_check;
 ALTER TABLE csv_registry ADD CONSTRAINT csv_registry_status_check
     CHECK (status IN ('pending_processing', 'draft', 'review', 'approved', 'processing_failed', 'rejected'));
 ALTER TABLE csv_registry ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+ALTER TABLE csv_registry ADD COLUMN IF NOT EXISTS published_to_pinecone BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE csv_registry ENABLE ROW LEVEL SECURITY;
 

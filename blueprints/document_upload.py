@@ -528,7 +528,7 @@ def list_documents(**kwargs):
     valid_statuses = ("draft", "review", "approved", "rejected", "pending_processing", "processing_failed")
 
     # Query documents table (PDF/DOCX)
-    doc_cols = "id, tenant_id, filename, file_type, status, uploaded_by, chunk_count, rejection_reason, created_at, updated_at"
+    doc_cols = "id, tenant_id, filename, file_type, status, uploaded_by, chunk_count, published_to_pinecone, rejection_reason, created_at, updated_at"
     doc_q = supabase.table("documents").select(doc_cols).eq("tenant_id", tenant_id)
     if status and status in valid_statuses:
         doc_q = doc_q.eq("status", status)
@@ -536,7 +536,7 @@ def list_documents(**kwargs):
     doc_items = doc_result.data or []
 
     # Query csv_registry table (CSV) — normalise to same shape
-    csv_cols = "id, tenant_id, filename, status, uploaded_by, chunk_count, rejection_reason, created_at, updated_at"
+    csv_cols = "id, tenant_id, filename, status, uploaded_by, chunk_count, published_to_pinecone, rejection_reason, created_at, updated_at"
     csv_q = supabase.table("csv_registry").select(csv_cols).eq("tenant_id", tenant_id)
     if status and status in valid_statuses:
         csv_q = csv_q.eq("status", status)
@@ -568,7 +568,7 @@ def get_document(document_id: str, **kwargs):
         return jsonify({"error": "Database not configured"}), 500
 
     # --- Try documents table first (PDF / DOCX) ---
-    doc_cols = "id, tenant_id, filename, file_type, status, uploaded_by, chunk_count, rejection_reason, created_at, updated_at"
+    doc_cols = "id, tenant_id, filename, file_type, status, uploaded_by, chunk_count, published_to_pinecone, rejection_reason, created_at, updated_at"
     doc_result = supabase.table("documents").select(doc_cols).eq("id", document_id).eq("tenant_id", tenant_id).execute()
     if doc_result.data:
         doc = doc_result.data[0]
@@ -586,7 +586,7 @@ def get_document(document_id: str, **kwargs):
         })
 
     # --- Fall back to csv_registry (CSV) ---
-    csv_cols = "id, tenant_id, filename, status, uploaded_by, chunk_count, rejection_reason, created_at, updated_at"
+    csv_cols = "id, tenant_id, filename, status, uploaded_by, chunk_count, published_to_pinecone, rejection_reason, created_at, updated_at"
     csv_result = supabase.table("csv_registry").select(csv_cols).eq("id", document_id).eq("tenant_id", tenant_id).execute()
     if not csv_result.data:
         return jsonify({"error": "Document not found"}), 404
