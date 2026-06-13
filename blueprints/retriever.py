@@ -9,9 +9,10 @@ returned, the legacy JSON query planner + single Pinecone query is used unchange
 
 Optional temporary files: send multipart/form-data with field ``query`` (or ``question``)
 and one or more ``file`` parts (same name as bulk upload). JSON body without files
-is unchanged. Embeddings + query planner always use the tenant's active OpenAI row;
-the final answer streams from the most recently updated active provider (openai,
-anthropic, or mistral).
+is unchanged. Embeddings + the query planner/tool-calling agent always use this
+server's own OpenAI key (``Config.OPENAI_API_KEY``); the final answer streams from
+the tenant's selected ``llm_providers`` row (openai, anthropic, or mistral), chosen
+via ``llm_provider_id`` or, if omitted, the most recently updated active row.
 """
 import base64
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import anthropic
+import openai
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from werkzeug.utils import secure_filename
 
@@ -29,7 +31,10 @@ from config import Config
 from utils.audit import log_audit_event
 from utils.auth_helpers import require_auth
 from utils.document_utils import extract_text_from_docx, extract_text_from_image, extract_text_from_pdf
-from utils.llm_providers import resolve_tenant_openai_for_retriever, resolve_tenant_primary_answer_provider
+from utils.llm_providers import (
+    resolve_tenant_answer_provider_by_id,
+    resolve_tenant_primary_answer_provider,
+)
 from utils.supabase_retry import execute_with_retry
 from utils.retriever_langchain_tools import (
     build_retrieval_tools,
@@ -139,10 +144,19 @@ def _sse(event: str, data: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def _parse_stream_request() -> Tuple[str, int, List[Tuple[str, bytes, str]]]:
-    """Returns (user_query, top_k, attachments) where each attachment is (filename, raw_bytes, content_type)."""
+def _sse_data(payload: Dict[str, Any]) -> str:
+    """Plain ``data:`` SSE line (no ``event:`` field), shared by all answer providers
+    for status/content/done events so clients handle openai/anthropic/mistral identically."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _parse_stream_request() -> Tuple[str, int, List[Tuple[str, bytes, str]], Optional[str]]:
+    """Returns (user_query, top_k, attachments, llm_provider_id) where each attachment
+    is (filename, raw_bytes, content_type). ``llm_provider_id``, if given, selects which
+    of the tenant's ``llm_providers`` rows answers the query (see /llm-providers)."""
     attachments: List[Tuple[str, bytes, str]] = []
     top_k = 8
+    llm_provider_id: Optional[str] = None
 
     ct = (request.content_type or "").lower()
     if "multipart/form-data" in ct:
@@ -153,6 +167,7 @@ def _parse_stream_request() -> Tuple[str, int, List[Tuple[str, bytes, str]]]:
                 top_k = int(tk)
             except (TypeError, ValueError):
                 top_k = 8
+        llm_provider_id = (request.form.get("llm_provider_id") or "").strip() or None
         files = request.files.getlist("file")
         for f in files:
             if not f or not getattr(f, "filename", None):
@@ -169,9 +184,10 @@ def _parse_stream_request() -> Tuple[str, int, List[Tuple[str, bytes, str]]]:
             top_k = int(tk)
         except (TypeError, ValueError):
             top_k = 8
+        llm_provider_id = (str(body.get("llm_provider_id") or "").strip()) or None
 
     top_k = max(1, min(top_k, 20))
-    return user_query, top_k, attachments
+    return user_query, top_k, attachments, llm_provider_id
 
 
 def _safe_filename(name: str) -> str:
@@ -438,13 +454,13 @@ def _stream_anthropic_chat(
 
     file_ids: List[str] = []
     if pdfs:
-        yield _sse(
-            "status",
+        yield _sse_data(
             {
+                "type": "status",
                 "stage": "anthropic_uploads",
                 "message": f"Uploading {min(len(pdfs), 5)} PDF(s) for better answers",
                 "pdf_count": min(len(pdfs), 5),
-            },
+            }
         )
     for name, raw, mime in pdfs[:5]:
         try:
@@ -465,14 +481,14 @@ def _stream_anthropic_chat(
     content.extend(img_blocks)
 
     try:
-        yield _sse(
-            "status",
+        yield _sse_data(
             {
+                "type": "status",
                 "stage": "provider_stream_start",
                 "message": "Starting model response stream",
                 "provider": "anthropic",
                 "model": model,
-            },
+            }
         )
         kwargs: Dict[str, Any] = {
             "model": model,
@@ -485,7 +501,7 @@ def _stream_anthropic_chat(
         with client.messages.stream(**kwargs) as stream:
             for text in stream.text_stream:
                 if text:
-                    yield _sse("token", {"text": text})
+                    yield _sse_data({"type": "content", "message": text})
     except Exception as e:
         logger.warning("Anthropic stream with attachments failed (%s); retrying text-only.", e)
         with client.messages.stream(
@@ -496,10 +512,26 @@ def _stream_anthropic_chat(
         ) as stream:
             for text in stream.text_stream:
                 if text:
-                    yield _sse("token", {"text": text})
+                    yield _sse_data({"type": "content", "message": text})
 
 
-def _stream_mistral_chat(api_key: str, model: str, system_msg: str, user_text: str) -> Generator[str, None, None]:
+# Mistral models that accept image_url content chunks (vision). Other models
+# (e.g. mistral-small-latest, codestral-latest) reject multimodal content.
+_MISTRAL_VISION_MODEL_HINTS = ("pixtral",)
+
+
+def _mistral_model_supports_vision(model: str) -> bool:
+    m = (model or "").lower()
+    return any(hint in m for hint in _MISTRAL_VISION_MODEL_HINTS)
+
+
+def _stream_mistral_chat(
+    api_key: str,
+    model: str,
+    system_msg: str,
+    user_text: str,
+    bundle: Dict[str, Any],
+) -> Generator[str, None, None]:
     try:
         from mistralai import Mistral
     except ImportError:
@@ -507,11 +539,17 @@ def _stream_mistral_chat(api_key: str, model: str, system_msg: str, user_text: s
         return
 
     client = Mistral(api_key=api_key)
-    # Plain-text path with optional system preamble (Mistral chat accepts system in messages on many models)
+
+    image_parts = bundle.get("openai_image_parts") or []
+    if image_parts and _mistral_model_supports_vision(model):
+        user_content: Any = [{"type": "text", "text": user_text}, *image_parts]
+    else:
+        user_content = user_text
+
     messages = []
     if system_msg:
         messages.append({"role": "system", "content": system_msg})
-    messages.append({"role": "user", "content": user_text})
+    messages.append({"role": "user", "content": user_content})
 
     try:
         stream_response = client.chat.stream(model=model, messages=messages)
@@ -527,7 +565,7 @@ def _stream_mistral_chat(api_key: str, model: str, system_msg: str, user_text: s
                 delta = getattr(chunk.choices[0], "delta", None)
                 piece = getattr(delta, "content", None) if delta is not None else None
             if piece:
-                yield _sse("token", {"text": piece})
+                yield _sse_data({"type": "content", "message": piece})
     except Exception as e:
         logger.exception("Mistral stream failed")
         yield _sse("error", {"message": f"Mistral streaming failed: {e}"})
@@ -539,6 +577,7 @@ def _stream_retrieval(
     user_query: str,
     top_k: int,
     attachments: List[Tuple[str, bytes, str]],
+    llm_provider_id: Optional[str] = None,
     actor_email: str = "",
     actor_role: str = "user",
     ip_address: str = "",
@@ -580,23 +619,42 @@ def _stream_retrieval(
             },
         )
     encryption_service = getattr(current_app, "encryption_service", None)
-    openai_client, chat_model_oai, filter_model, embedding_model, llm_err = (
-        resolve_tenant_openai_for_retriever(supabase, tenant_id, encryption_service)
-    )
-    if llm_err or not openai_client:
-        yield _sse(
-            "error",
-            {"message": llm_err or "OpenAI is not configured for this tenant (required for embeddings)."},
-        )
+
+    # Embeddings and retrieval planning/tool-calling always use this server's own
+    # OpenAI key (Config.OPENAI_API_KEY) and models, regardless of tenant LLM providers.
+    try:
+        embed_client = openai.OpenAI(api_key=Config.OPENAI_API_KEY)
+    except Exception as e:
+        logger.exception("Embedding client init failed")
+        yield _sse("error", {"message": f"Embedding provider not configured: {e}"})
         return
 
-    ptype, pkey, pmodel, perr = resolve_tenant_primary_answer_provider(
-        supabase, tenant_id, encryption_service
-    )
-    if perr or not ptype:
-        ptype = "openai"
-        pkey = None
-        pmodel = chat_model_oai
+    openai_client = embed_client
+    filter_model = Config.RETRIEVER_FILTER_MODEL
+    embedding_model = Config.RETRIEVER_EMBEDDING_MODEL
+
+    # The final answer always comes from one of the tenant's configured
+    # llm_providers rows (openai, anthropic, or mistral).
+    if llm_provider_id:
+        ptype, pkey, pmodel, perr = resolve_tenant_answer_provider_by_id(
+            supabase, tenant_id, encryption_service, llm_provider_id
+        )
+        if perr or not ptype:
+            yield _sse("error", {"message": perr or "Invalid llm_provider_id."})
+            return
+    else:
+        ptype, pkey, pmodel, perr = resolve_tenant_primary_answer_provider(
+            supabase, tenant_id, encryption_service
+        )
+        if perr or not ptype:
+            yield _sse(
+                "error",
+                {
+                    "message": perr
+                    or "No active LLM provider configured for this tenant. Add one under LLM providers."
+                },
+            )
+            return
     answer_model = _default_model_for_provider(ptype, pmodel)
 
     # User-selected language (explicit, no auto-detection). Default is English.
@@ -648,7 +706,7 @@ def _stream_retrieval(
         return
 
     tools, tool_state = build_retrieval_tools(
-        openai_client,
+        embed_client,
         embedding_model,
         index,
         namespace,
@@ -710,6 +768,7 @@ def _stream_retrieval(
             "search_query": search_query,
             "pinecone_filter": pinecone_filter,
             "answer_provider": ptype,
+            "answer_model": answer_model,
             "retrieval_mode": "langchain_tools",
             "tool_trace": tool_state.get("tool_trace") or [],
         }
@@ -760,6 +819,7 @@ def _stream_retrieval(
             "search_query": search_query,
             "pinecone_filter": pinecone_filter,
             "answer_provider": ptype,
+            "answer_model": answer_model,
             "retrieval_mode": "legacy_planner",
         }
         if reasoning:
@@ -775,7 +835,7 @@ def _stream_retrieval(
 
         try:
             with ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(_embed_query, openai_client, search_query, embedding_model)
+                fut = ex.submit(_embed_query, embed_client, search_query, embedding_model)
                 hb = 0
                 while True:
                     try:
@@ -872,9 +932,10 @@ def _stream_retrieval(
 
     try:
         if ptype == "openai":
-            def _sse_data(payload: Dict[str, Any]) -> str:
-                return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
+            if not pkey:
+                yield _sse("error", {"message": "OpenAI API key missing."})
+                return
+            answer_client = openai.OpenAI(api_key=pkey)
             yield _sse_data(
                 {
                     "type": "status",
@@ -885,7 +946,7 @@ def _stream_retrieval(
                 }
             )
             for piece in _stream_openai_chat(
-                openai_client,
+                answer_client,
                 answer_model,
                 system_msg,
                 user_body,
@@ -903,16 +964,16 @@ def _stream_retrieval(
             if not pkey:
                 yield _sse("error", {"message": "Mistral API key missing."})
                 return
-            yield _sse(
-                "status",
+            yield _sse_data(
                 {
+                    "type": "status",
                     "stage": "provider_stream_start",
                     "message": "Starting model response stream",
                     "provider": "mistral",
                     "model": answer_model,
-                },
+                }
             )
-            for evt in _stream_mistral_chat(pkey, answer_model, system_msg, user_body):
+            for evt in _stream_mistral_chat(pkey, answer_model, system_msg, user_body, bundle):
                 yield evt
         else:
             yield _sse("error", {"message": f"Unsupported answer provider: {ptype}"})
@@ -922,11 +983,7 @@ def _stream_retrieval(
         yield _sse("error", {"message": f"Response generation failed: {e}"})
         return
 
-    if ptype == "openai":
-        yield f"data: {json.dumps({'type': 'done', 'message': 'Completado'}, ensure_ascii=False)}\n\n"
-    else:
-        yield _sse("status", {"stage": "complete", "message": "Done"})
-        yield _sse("done", {})
+    yield _sse_data({"type": "done", "message": "Completado"})
 
 
 @retriever_bp.route("/retriever/stream", methods=["POST"])
@@ -935,20 +992,34 @@ def retriever_stream(**kwargs):
     """
     Stream a retrieval-augmented answer as Server-Sent Events.
 
-    **JSON** (default, unchanged):
-      ``{"query": "...", "top_k": 8}`` — ``question`` is accepted as an alias for ``query``.
+    **JSON**:
+      ``{"query": "...", "top_k": 8, "llm_provider_id": "..."}`` — ``question`` is
+      accepted as an alias for ``query``. ``llm_provider_id`` is optional.
 
     **Multipart** (optional temporary files, ChatGPT-style):
       - ``query`` or ``question``: text field
       - ``top_k``: optional text field
+      - ``llm_provider_id``: optional text field
       - ``file``: one or more file parts (same field name repeated)
 
-    Embeddings and the Pinecone query planner always use the tenant's active **OpenAI**
-    row. The streamed answer uses the **most recently updated** active row in
-    ``llm_providers`` (openai, anthropic, or mistral).
+    ``llm_provider_id`` (optional): the ``id`` of one of this tenant's rows from
+    ``GET /llm-providers`` (openai, anthropic, or mistral). If given, that provider's
+    ``provider_type``/``default_model``/API key are used to generate the answer; the id
+    must belong to this tenant and be active, or the stream emits an ``error`` event.
+    If omitted, the **most recently updated** active row in ``llm_providers`` is used
+    (previous default behavior).
 
-    SSE events:
-      - ``status``, ``plan``, ``token``, ``done``, ``error``
+    Embeddings and the Pinecone query planner always use this server's own OpenAI key
+    (``OPENAI_API_KEY`` in config), regardless of ``llm_provider_id`` — tenant LLM
+    providers never affect embeddings.
+
+    SSE events (all providers emit identically):
+      - ``event: status|plan|error`` lines (``data`` has ``stage``/``message`` etc.) for
+        retrieval progress, the retrieval ``plan``, and fatal errors.
+      - Plain ``data: {"type": "status"|"content"|"done", ...}`` lines (no ``event:``
+        field) for the answer-generation phase: a ``status`` with
+        ``stage: "provider_stream_start"``, one ``content`` per streamed token
+        (``message`` holds the text), and a final ``done``.
 
     The ``plan`` event may include ``retrieval_mode`` (``langchain_tools`` or
     ``legacy_planner``) and, for tool retrieval, ``tool_trace`` describing each tool call.
@@ -962,7 +1033,7 @@ def retriever_stream(**kwargs):
     actor_role = user_meta.get("role") or app_meta.get("role") or "user"
     ip_address = request.remote_addr or ""
 
-    user_query, top_k, attachments = _parse_stream_request()
+    user_query, top_k, attachments, llm_provider_id = _parse_stream_request()
     if not user_query:
         return jsonify({"error": "query (or question) is required"}), 400
 
@@ -975,6 +1046,7 @@ def retriever_stream(**kwargs):
     response = Response(
         stream_with_context(_stream_retrieval(
             tenant_id, user_id, user_query, top_k, attachments,
+            llm_provider_id=llm_provider_id,
             actor_email=actor_email, actor_role=actor_role, ip_address=ip_address,
         )),
         mimetype="text/event-stream",

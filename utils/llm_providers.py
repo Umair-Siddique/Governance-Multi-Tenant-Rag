@@ -485,6 +485,61 @@ def resolve_tenant_openai_for_retriever(
     return client, chat_model, filter_model, embedding_model, None
 
 
+def resolve_tenant_answer_provider_by_id(
+    supabase,
+    tenant_id: str,
+    encryption_service,
+    provider_id: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Load a specific tenant ``llm_providers`` row by id, for the final streamed answer.
+
+    Used when the caller (frontend) explicitly picks which of the tenant's configured
+    LLM providers to answer with, instead of the most-recently-updated one.
+
+    Returns:
+        (provider_type, decrypted_api_key, default_model, error_message)
+        Any field except error may be None when error_message is set.
+    """
+    if not supabase:
+        return None, None, None, "Database not configured"
+    if not encryption_service:
+        return None, None, None, "Encryption service not configured (ENCRYPTION_KEY)"
+    if not (provider_id or "").strip():
+        return None, None, None, "llm_provider_id is required"
+
+    try:
+        result = (
+            supabase.table("llm_providers")
+            .select("provider_type, encrypted_api_key, default_model, is_active")
+            .eq("id", provider_id)
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        return None, None, None, f"Failed to load LLM provider: {e}"
+
+    if not result.data:
+        return None, None, None, "llm_provider_id does not match a provider configured for this tenant."
+
+    row = result.data[0]
+    if not row.get("is_active", True):
+        return None, None, None, "Selected LLM provider is not active."
+
+    ptype = (row.get("provider_type") or "").strip().lower()
+    try:
+        api_key = encryption_service.decrypt(row["encrypted_api_key"])
+    except Exception as e:
+        return None, None, None, f"Could not decrypt stored API key: {e}"
+
+    if not (api_key or "").strip():
+        return None, None, None, "API key is missing in LLM provider settings"
+
+    default_model = (row.get("default_model") or "").strip()
+    return ptype, api_key.strip(), default_model, None
+
+
 def resolve_tenant_primary_answer_provider(
     supabase,
     tenant_id: str,
