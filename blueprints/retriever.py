@@ -534,8 +534,9 @@ def _stream_mistral_chat(
 ) -> Generator[str, None, None]:
     try:
         from mistralai import Mistral
-    except ImportError:
-        yield _sse("error", {"message": "Mistral SDK not installed (mistralai package)."})
+    except Exception as e:
+        logger.exception("Mistral SDK import failed")
+        yield _sse("error", {"message": f"Mistral SDK unavailable on server: {e}"})
         return
 
     client = Mistral(api_key=api_key)
