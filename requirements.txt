@@ -6,7 +6,7 @@ openai
 itsdangerous
 cryptography
 anthropic
-mistralai
+mistralai==1.12.1
 pinecone
 langchain-core
 gunicorn
