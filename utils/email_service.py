@@ -176,18 +176,19 @@ def _html_wrapper(header_icon: str, header_title: str, body_html: str, footer_no
 
 
 class EmailService:
-    def __init__(self, admin_email: str, app_password: str):
-        """
-        Initialize email service with Gmail credentials.
-
-        Args:
-            admin_email: Gmail address used as sender.
-            app_password: Gmail app-specific password.
-        """
-        self.admin_email = admin_email
-        self.app_password = app_password
-        self.smtp_server = "smtp.gmail.com"
-        self.smtp_port   = 587
+    def __init__(
+        self,
+        mail_from: str,
+        password: str,
+        smtp_server: str = "mail.elorag.com",
+        smtp_port: int = 465,
+        use_ssl: bool = True,
+    ):
+        self.mail_from   = mail_from
+        self.password    = password
+        self.smtp_server = smtp_server
+        self.smtp_port   = smtp_port
+        self.use_ssl     = use_ssl
 
     # ------------------------------------------------------------------
     # Core sender
@@ -199,10 +200,10 @@ class EmailService:
         html_body: str,
         text_body: Optional[str] = None
     ) -> bool:
-        """Send an email via Gmail SMTP."""
+        """Send an email via SMTP (SSL or STARTTLS based on config)."""
         try:
             message = MIMEMultipart('alternative')
-            message['From']    = f"{BRAND_NAME} <{self.admin_email}>"
+            message['From']    = f"{BRAND_NAME} <{self.mail_from}>"
             message['To']      = to_email
             message['Subject'] = subject
 
@@ -210,15 +211,22 @@ class EmailService:
                 message.attach(MIMEText(text_body, 'plain'))
             message.attach(MIMEText(html_body, 'html'))
 
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls()
-                server.login(self.admin_email, self.app_password)
-                server.send_message(message)
+            if self.use_ssl:
+                with smtplib.SMTP_SSL(self.smtp_server, self.smtp_port) as server:
+                    server.login(self.mail_from, self.password)
+                    server.send_message(message)
+            else:
+                with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                    server.starttls()
+                    server.login(self.mail_from, self.password)
+                    server.send_message(message)
 
             return True
 
         except Exception as e:
+            import traceback
             print(f"[{BRAND_NAME}] Failed to send email to {to_email}: {str(e)}")
+            traceback.print_exc()
             return False
 
     # ------------------------------------------------------------------

@@ -641,8 +641,30 @@ def _stream_retrieval(
             supabase, tenant_id, encryption_service, llm_provider_id
         )
         if perr or not ptype:
-            yield _sse("error", {"message": perr or "Invalid llm_provider_id."})
-            return
+            # Selected provider not found for this tenant — fall back to the primary provider.
+            logger.warning(
+                "llm_provider_id %s not found for tenant %s (%s); falling back to primary provider.",
+                llm_provider_id, tenant_id, perr,
+            )
+            yield _sse(
+                "status",
+                {
+                    "stage": "provider_fallback",
+                    "message": "The selected model is no longer available for this workspace. Using the default model instead.",
+                },
+            )
+            ptype, pkey, pmodel, perr = resolve_tenant_primary_answer_provider(
+                supabase, tenant_id, encryption_service
+            )
+            if perr or not ptype:
+                yield _sse(
+                    "error",
+                    {
+                        "message": perr
+                        or "No active LLM provider configured for this tenant. Add one under Settings → LLM Providers."
+                    },
+                )
+                return
     else:
         ptype, pkey, pmodel, perr = resolve_tenant_primary_answer_provider(
             supabase, tenant_id, encryption_service
@@ -652,7 +674,7 @@ def _stream_retrieval(
                 "error",
                 {
                     "message": perr
-                    or "No active LLM provider configured for this tenant. Add one under LLM providers."
+                    or "No active LLM provider configured for this tenant. Add one under Settings → LLM Providers."
                 },
             )
             return

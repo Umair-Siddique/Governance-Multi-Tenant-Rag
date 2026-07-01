@@ -19,8 +19,12 @@ def _default_tesseract_cmd():
 class Config:
     SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
     SUPABASE_URL = os.getenv("SUPABASE_URL")
-    GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-    ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+    MAIL_SERVER = os.getenv("MAIL_SERVER", "mail.elorag.com")
+    MAIL_PORT = int(os.getenv("MAIL_PORT", "465"))
+    MAIL_USE_SSL = os.getenv("MAIL_USE_SSL", "True").lower() == "true"
+    MAIL_USERNAME = os.getenv("MAIL_USERNAME")
+    MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
+    MAIL_FROM = os.getenv("MAIL_FROM")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
     # Retriever / RAG (same OPENAI_API_KEY as the rest of the app)

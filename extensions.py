@@ -21,10 +21,16 @@ def init_supabase(app):
 
 def init_email_service(app):
     """Initialize Email service"""
-    if Config.ADMIN_EMAIL and Config.GMAIL_APP_PASSWORD:
-        email_service = EmailService(Config.ADMIN_EMAIL, Config.GMAIL_APP_PASSWORD)
+    if Config.MAIL_USERNAME and Config.MAIL_PASSWORD:
+        email_service = EmailService(
+            mail_from=Config.MAIL_FROM or Config.MAIL_USERNAME,
+            password=Config.MAIL_PASSWORD,
+            smtp_server=Config.MAIL_SERVER,
+            smtp_port=Config.MAIL_PORT,
+            use_ssl=Config.MAIL_USE_SSL,
+        )
         app.email_service = email_service
-        
+
         print("✅ Email service initialized successfully")
     else:
         app.email_service = None
