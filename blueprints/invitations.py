@@ -7,6 +7,7 @@ from flask import Blueprint, request, jsonify, current_app
 
 from utils.audit import log_audit_event
 from utils.auth_helpers import require_role
+from blueprints.branding import _build_payload as _build_branding_payload
 
 # Admin CRUD routes  →  registered under /api
 invitations_bp = Blueprint('invitations', __name__)
@@ -372,14 +373,17 @@ def validate_invite_token(token):
         if inv['status'] != 'pending':
             return jsonify({'error': 'Invalid invitation status'}), 400
 
-        # Resolve tenant name
+        # Resolve tenant name + branding so the invite page can reflect
+        # the inviting tenant's white-label identity before the user has a session.
         tenant_row = (
             supabase.table('tenants')
-            .select('tenant_name')
+            .select('id, tenant_name, tenant_type, tenant_details, custom_domain')
             .eq('id', tenant_id)
             .execute()
         )
-        tenant_name = (tenant_row.data[0].get('tenant_name') or 'Your Organisation') if tenant_row.data else 'Your Organisation'
+        tenant = tenant_row.data[0] if tenant_row.data else None
+        tenant_name = (tenant.get('tenant_name') or 'Your Organisation') if tenant else 'Your Organisation'
+        branding = _build_branding_payload(tenant) if tenant else {}
 
         return jsonify({
             'invitation': {
@@ -388,7 +392,8 @@ def validate_invite_token(token):
                 'role': inv['role'],
                 'tenant_name': tenant_name,
                 'expires_at': _fmt(inv.get('expires_at')),
-            }
+            },
+            'branding': branding,
         }), 200
 
     except Exception as e:

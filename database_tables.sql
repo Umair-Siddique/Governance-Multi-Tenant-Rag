@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     tenant_name VARCHAR(255),
     tenant_type VARCHAR(50) DEFAULT 'self_managed' CHECK (tenant_type IN ('self_managed', 'white_label')),
     tenant_details JSONB DEFAULT '{}'::jsonb,
+    custom_domain VARCHAR(255) UNIQUE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -12,6 +13,7 @@ CREATE TABLE IF NOT EXISTS tenants (
 -- Safe migration block for existing environments
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tenant_name VARCHAR(255);
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tenant_details JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS custom_domain VARCHAR(255) UNIQUE;
 ALTER TABLE tenants DROP CONSTRAINT IF EXISTS tenants_tenant_type_check;
 ALTER TABLE tenants ADD CONSTRAINT tenants_tenant_type_check CHECK (tenant_type IN ('self_managed', 'white_label'));
 
